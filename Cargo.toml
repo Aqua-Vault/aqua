@@ -1,0 +1,18 @@
+[workspace]
+resolver = "2"
+members = ["contracts/aqua_vault", "contracts/mock_pool"]
+
+[workspace.dependencies]
+soroban-sdk = "=27.0.5"
+
+[profile.release]
+opt-level = 3
+lto = true
+overflow-checks = true
+codegen-units = 1
+strip = "symbols"
+panic = "abort"
+
+[profile.release-with-logs]
+inherits = "release"
+debug-assertions = true
