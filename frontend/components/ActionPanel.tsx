@@ -6,6 +6,8 @@ interface Props {
   publicKey: string | null;
   userBalance: bigint;
   usdcBalance: bigint;
+  amount: string;
+  onAmountChange: (value: string) => void;
   onConnect: () => void;
   onDone: () => void;
 }
@@ -16,11 +18,12 @@ export default function ActionPanel({
   publicKey,
   userBalance,
   usdcBalance,
+  amount,
+  onAmountChange,
   onConnect,
   onDone,
 }: Props) {
   const [tab, setTab] = useState<Tab>("deposit");
-  const [amount, setAmount] = useState("");
   const [busy, setBusy] = useState(false);
   const [msg, setMsg] = useState<{ kind: "ok" | "err"; text: string } | null>(
     null,
@@ -63,7 +66,7 @@ export default function ActionPanel({
           raw,
         )} · tx ${res.hash.slice(0, 8)}…`,
       });
-      setAmount("");
+      onAmountChange("");
       onDone();
     } catch (err: any) {
       setMsg({ kind: "err", text: err?.message || "Transaction failed" });
@@ -99,7 +102,7 @@ export default function ActionPanel({
         <span>Amount (USDC)</span>
         <button
           className="text-aqua-300 hover:text-aqua-200"
-          onClick={() => setAmount(fromStroops(max, 7))}
+          onClick={() => onAmountChange(fromStroops(max, 7))}
           type="button"
         >
           Max: {formatUsd(max)}
@@ -111,7 +114,7 @@ export default function ActionPanel({
         inputMode="decimal"
         placeholder="0.00"
         value={amount}
-        onChange={(e) => setAmount(e.target.value.replace(/[^0-9.]/g, ""))}
+        onChange={(e) => onAmountChange(e.target.value.replace(/[^0-9.]/g, ""))}
       />
 
       {validation && (

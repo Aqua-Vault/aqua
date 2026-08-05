@@ -20,6 +20,7 @@ import {
   VAULT_ID,
 } from "./config";
 import { signTransaction, getPublicKey } from "./freighter";
+import { getLedgerCloseTime } from "./ledger";
 
 const server = new rpc.Server(RPC_URL, {
   allowHttp: RPC_URL.startsWith("http://"),
@@ -30,6 +31,8 @@ export interface VaultStats {
   currentYield: bigint;
   secondsUntilNextDraw: number;
   participants: string[];
+  /** Close time (ms) of the ledger the stats were read at; null if unavailable. */
+  ledgerCloseMs: number | null;
 }
 
 // ---------------------------------------------------------------------------
@@ -153,18 +156,22 @@ async function invokeWrite(
 // ---------------------------------------------------------------------------
 
 export async function getVaultStats(): Promise<VaultStats> {
-  const raw = await simulateRead<{
-    total_deposits: bigint;
-    current_yield: bigint;
-    seconds_until_next_draw: bigint;
-    participants: string[];
-  }>(VAULT_ID, "get_vault_stats", []);
+  const [raw, ledgerCloseMs] = await Promise.all([
+    simulateRead<{
+      total_deposits: bigint;
+      current_yield: bigint;
+      seconds_until_next_draw: bigint;
+      participants: string[];
+    }>(VAULT_ID, "get_vault_stats", []),
+    getLedgerCloseTime(),
+  ]);
 
   return {
     totalDeposits: BigInt(raw.total_deposits),
     currentYield: BigInt(raw.current_yield),
     secondsUntilNextDraw: Number(raw.seconds_until_next_draw),
     participants: raw.participants ?? [],
+    ledgerCloseMs,
   };
 }
 

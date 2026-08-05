@@ -14,6 +14,67 @@ import {
 } from "@stellar/freighter-api";
 import { NETWORK_PASSPHRASE } from "./config";
 
+// freighter-api v2 ships no onAccountChange/onNetworkChange, but the runtime
+// extension object may expose them on newer versions. Feature-detect, and fall
+// back to polling so the app still reacts to extension-side switches.
+interface FreighterWithSubscriptions {
+  onAccountChange?: (cb: (account: string | null) => void) => void;
+  onNetworkChange?: (cb: (network: string | null) => void) => void;
+}
+
+const SUBSCRIBE_POLL_MS = 2000;
+
+type Unsubscribe = () => void;
+
+/** Invoke `cb` whenever the connected account changes. */
+export function subscribeToAccountChanges(
+  cb: (publicKey: string | null) => void,
+): Unsubscribe {
+  const f = (window as unknown as { freighter?: FreighterWithSubscriptions })
+    .freighter;
+  if (f?.onAccountChange) {
+    const listener = (account: string | null) => cb(account);
+    f.onAccountChange(listener);
+    return () => {
+      /* v2 API has no unsubscribe — poll fallback cleans up its own timer */
+    };
+  }
+  let last: string | null | undefined;
+  const id = setInterval(async () => {
+    const pk = await getPublicKey().catch(() => null);
+    if (pk !== last) {
+      last = pk;
+      cb(pk);
+    }
+  }, SUBSCRIBE_POLL_MS);
+  return () => clearInterval(id);
+}
+
+/** Invoke `cb` whenever the wallet's network passphrase changes. */
+export function subscribeToNetworkChanges(
+  cb: (network: { network: string; networkPassphrase: string } | null) => void,
+): Unsubscribe {
+  const f = (window as unknown as { freighter?: FreighterWithSubscriptions })
+    .freighter;
+  if (f?.onNetworkChange) {
+    const listener = (network: string | null) =>
+      cb(network ? { network, networkPassphrase: network } : null);
+    f.onNetworkChange(listener);
+    return () => {
+      /* no-op unsubscribe as above */
+    };
+  }
+  let lastPassphrase: string | null | undefined;
+  const id = setInterval(async () => {
+    const details = await getWalletNetwork().catch(() => null);
+    if (details && details.networkPassphrase !== lastPassphrase) {
+      lastPassphrase = details.networkPassphrase;
+      cb(details);
+    }
+  }, SUBSCRIBE_POLL_MS);
+  return () => clearInterval(id);
+}
+
 export async function isFreighterInstalled(): Promise<boolean> {
   try {
     return await fIsConnected();

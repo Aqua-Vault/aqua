@@ -53,6 +53,12 @@ export function shortenAddress(addr: string, chars = 4): string {
   return `${addr.slice(0, chars)}…${addr.slice(-chars)}`;
 }
 
+/** Shorten a 64-hex transaction hash for display. */
+export function shortenHash(hash: string, chars = 6): string {
+  if (hash.length <= chars * 2 + 3) return hash;
+  return `${hash.slice(0, chars)}…${hash.slice(-chars)}`;
+}
+
 /** Win probability as a percentage string. */
 export function winProbability(userDeposit: bigint, tvl: bigint): string {
   if (tvl <= BigInt(0)) return "0.00";

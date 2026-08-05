@@ -4,11 +4,11 @@ import CountdownTimer from "./CountdownTimer";
 
 interface Props {
   stats: VaultStats | null;
-  anchorMs: number;
+  ledgerCloseMs: number | null;
   loading: boolean;
 }
 
-export default function StatsBar({ stats, anchorMs, loading }: Props) {
+export default function StatsBar({ stats, ledgerCloseMs, loading }: Props) {
   const prize = stats?.currentYield ?? BigInt(0);
   const tvl = stats?.totalDeposits ?? BigInt(0);
   const participants = stats?.participants.length ?? 0;
@@ -38,7 +38,7 @@ export default function StatsBar({ stats, anchorMs, loading }: Props) {
           ) : (
             <CountdownTimer
               initialSeconds={stats?.secondsUntilNextDraw ?? 0}
-              anchorMs={anchorMs}
+              ledgerCloseMs={ledgerCloseMs}
             />
           )}
         </div>

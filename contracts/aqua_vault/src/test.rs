@@ -508,3 +508,226 @@ fn test_full_lifecycle_multiple_rounds() {
     assert_eq!(stats.participants.len(), 0);
     assert_eq!(token_balance(&s, &s.mock_pool), 0);
 }
+
+// ---------------------------------------------------------------------------
+// Reentrancy guard (issue #6)
+// ---------------------------------------------------------------------------
+
+/// A hostile yield pool used to probe the vault's re-entrancy defenses. Its
+/// `deposit`/`withdraw` methods attempt to re-invoke the vault (for a
+/// configurable target) on their first call while armed, then behave like a
+/// plain pool.
+///
+/// NOTE: the Soroban host (protocol-level rule, SDK 27) hard-prohibits a
+/// contract from re-entering itself — any nested call back into the vault while
+/// the vault is on the call stack is rejected with a host error. So the probe
+/// below deliberately uses the non-`try_` client, which panics on that host
+/// error, and the tests assert the whole transaction reverts atomically: no
+/// double credit, no half-applied accounting. The vault's own
+/// Checks-Effects-Interactions ordering (`deposit`/`withdraw`) and the draw's
+/// `Locked` flag (`execute_prize_draw`) are the defense-in-depth layers that
+/// sit *behind* the host guard.
+#[contract]
+pub struct ReentrantPool;
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum RKey {
+    Vault,
+    Target,
+    Stored,
+    Reentered,
+    ArmWithdraw,
+    ArmDeposit,
+    ArmDraw,
+}
+
+#[contractimpl]
+impl ReentrantPool {
+    pub fn configure(e: Env, vault: Address, target: Address) {
+        e.storage().instance().set(&RKey::Vault, &vault);
+        e.storage().instance().set(&RKey::Target, &target);
+        e.storage().instance().set(&RKey::Stored, &0i128);
+        e.storage().instance().set(&RKey::Reentered, &false);
+        e.storage().instance().set(&RKey::ArmWithdraw, &false);
+        e.storage().instance().set(&RKey::ArmDeposit, &false);
+        e.storage().instance().set(&RKey::ArmDraw, &false);
+    }
+
+    pub fn arm(e: Env, withdraw: bool, deposit: bool, draw: bool) {
+        e.storage().instance().set(&RKey::ArmWithdraw, &withdraw);
+        e.storage().instance().set(&RKey::ArmDeposit, &deposit);
+        e.storage().instance().set(&RKey::ArmDraw, &draw);
+        e.storage().instance().set(&RKey::Reentered, &false);
+    }
+
+    /// Override the pool's reported balance (synthetic yield for draw tests).
+    pub fn set_stored(e: Env, v: i128) {
+        e.storage().instance().set(&RKey::Stored, &v);
+    }
+
+    pub fn deposit(e: Env, asset: Address, amount: i128) -> i128 {
+        let _ = asset;
+        let stored: i128 = e.storage().instance().get(&RKey::Stored).unwrap_or(0);
+        e.storage().instance().set(&RKey::Stored, &(stored + amount));
+        if armed(&e, &RKey::ArmDeposit) && fire_once(&e) {
+            let vault: Address = e.storage().instance().get(&RKey::Vault).unwrap();
+            let target: Address = e.storage().instance().get(&RKey::Target).unwrap();
+            // Nested vault call: the host blocks the re-entry, which panics this
+            // frame and reverts the entire deposit.
+            AquaVaultClient::new(&e, &vault).deposit(&target, &amount);
+        }
+        amount
+    }
+
+    pub fn withdraw(e: Env, asset: Address, to: Address, amount: i128) -> i128 {
+        let _ = asset;
+        let stored: i128 = e.storage().instance().get(&RKey::Stored).unwrap_or(0);
+        e.storage()
+            .instance()
+            .set(&RKey::Stored, &stored.saturating_sub(amount));
+        if armed(&e, &RKey::ArmWithdraw) && fire_once(&e) {
+            let vault: Address = e.storage().instance().get(&RKey::Vault).unwrap();
+            AquaVaultClient::new(&e, &vault).withdraw(&to, &amount);
+        }
+        if armed(&e, &RKey::ArmDraw) && fire_once(&e) {
+            let vault: Address = e.storage().instance().get(&RKey::Vault).unwrap();
+            AquaVaultClient::new(&e, &vault).execute_prize_draw();
+        }
+        amount
+    }
+
+    pub fn balance(e: Env, asset: Address, _owner: Address) -> i128 {
+        let _ = asset;
+        e.storage().instance().get(&RKey::Stored).unwrap_or(0)
+    }
+}
+
+fn armed(e: &Env, key: &RKey) -> bool {
+    e.storage().instance().get(key).unwrap_or(false)
+}
+
+/// Fire the re-entrancy probe at most once per arming, so a nested pool call
+/// (e.g. the inner withdraw's own `pool_withdraw`) cannot recurse forever.
+fn fire_once(e: &Env) -> bool {
+    if e.storage().instance().get(&RKey::Reentered).unwrap_or(false) {
+        return false;
+    }
+    e.storage().instance().set(&RKey::Reentered, &true);
+    true
+}
+
+#[test]
+fn test_reentrant_withdraw_reverts_atomically() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let u1 = Address::generate(&env);
+
+    let pool = env.register(ReentrantPool, ());
+    let sac = env.register_stellar_asset_contract_v2(pool.clone());
+    let token = sac.address();
+    token::StellarAssetClient::new(&env, &token).mint(&u1, &1_000_000_000_000i128);
+
+    let vault_id = env.register(AquaVault, ());
+    let vault = AquaVaultClient::new(&env, &vault_id);
+    ReentrantPoolClient::new(&env, &pool).configure(&vault_id, &u1);
+    vault.initialize(&admin, &token, &pool, &Some(86_400));
+
+    vault.deposit(&u1, &10_000);
+    ReentrantPoolClient::new(&env, &pool).arm(&true, &false, &false);
+
+    // The pool re-invokes withdraw(u1, 1_000) from inside the outer
+    // pool_withdraw. The host hard-blocks the re-entry, so the nested call
+    // panics and the whole withdrawal reverts: no double credit and no
+    // half-applied accounting.
+    let res = vault.try_withdraw(&u1, &1_000).unwrap_err();
+    assert!(res.is_err(), "re-entrant withdraw must fail, got {res:?}");
+
+    assert_eq!(vault.get_user_balance(&u1), 10_000);
+    assert_eq!(vault.get_vault_stats().total_deposits, 10_000);
+    assert_eq!(
+        token::Client::new(&env, &token).balance(&u1),
+        1_000_000_000_000 - 10_000
+    );
+}
+
+#[test]
+fn test_reentrant_deposit_reverts_atomically() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let u1 = Address::generate(&env);
+    let attacker = Address::generate(&env);
+
+    let pool = env.register(ReentrantPool, ());
+    let sac = env.register_stellar_asset_contract_v2(pool.clone());
+    let token = sac.address();
+    token::StellarAssetClient::new(&env, &token).mint(&u1, &1_000_000_000_000i128);
+    token::StellarAssetClient::new(&env, &token).mint(&attacker, &1_000_000_000_000i128);
+
+    let vault_id = env.register(AquaVault, ());
+    let vault = AquaVaultClient::new(&env, &vault_id);
+    ReentrantPoolClient::new(&env, &pool).configure(&vault_id, &attacker);
+    vault.initialize(&admin, &token, &pool, &Some(86_400));
+
+    vault.deposit(&u1, &10_000);
+    ReentrantPoolClient::new(&env, &pool).arm(&false, &true, &false);
+
+    // The pool re-invokes deposit(attacker, 5_000) from inside the outer
+    // pool_deposit. Re-entry is host-blocked, so the deposit reverts and the
+    // attacker gains nothing.
+    let res = vault.try_deposit(&u1, &5_000).unwrap_err();
+    assert!(res.is_err(), "re-entrant deposit must fail, got {res:?}");
+
+    assert_eq!(vault.get_user_balance(&u1), 10_000);
+    assert_eq!(vault.get_user_balance(&attacker), 0);
+    assert_eq!(vault.get_vault_stats().total_deposits, 10_000);
+}
+
+#[test]
+fn test_prize_draw_rejects_reentrant_invocation() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let u1 = Address::generate(&env);
+
+    let pool = env.register(ReentrantPool, ());
+    let sac = env.register_stellar_asset_contract_v2(pool.clone());
+    let token = sac.address();
+    token::StellarAssetClient::new(&env, &token).mint(&u1, &1_000_000_000_000i128);
+
+    let vault_id = env.register(AquaVault, ());
+    let vault = AquaVaultClient::new(&env, &vault_id);
+    ReentrantPoolClient::new(&env, &pool).configure(&vault_id, &u1);
+    vault.initialize(&admin, &token, &pool, &Some(86_400));
+
+    vault.deposit(&u1, &1_000);
+    // Seed extra so the pool can report a positive yield (1_200 vs 1_000).
+    token::StellarAssetClient::new(&env, &token).mint(&vault_id, &200);
+    ReentrantPoolClient::new(&env, &pool).set_stored(&1_200);
+
+    env.ledger().set_timestamp(env.ledger().timestamp() + 86_400);
+
+    // The pool re-invokes execute_prize_draw from inside the draw's
+    // pool_withdraw. The host blocks the re-entry (and the vault's Locked flag
+    // would reject it too), so the draw reverts.
+    ReentrantPoolClient::new(&env, &pool).arm(&false, &false, &true);
+    let res = vault.try_execute_prize_draw().unwrap_err();
+    assert!(res.is_err(), "re-entrant draw must fail, got {res:?}");
+
+    // The draw never completed: principal untouched, no prize paid.
+    assert_eq!(vault.get_user_balance(&u1), 1_000);
+    assert_eq!(vault.get_vault_stats().total_deposits, 1_000);
+    assert_eq!(
+        token::Client::new(&env, &token).balance(&u1),
+        1_000_000_000_000 - 1_000
+    );
+    // The reverted draw emitted no events (the host rolls the whole failed
+    // frame back), so there is no `aqua_prize_awarded` and no re-armed timer.
+    let events = env.events().all().filter_by_contract(&vault_id);
+    assert_eq!(events.events().len(), 0, "reverted draw must emit no events");
+}

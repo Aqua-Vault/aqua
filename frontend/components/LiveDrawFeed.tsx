@@ -1,6 +1,6 @@
 import { DrawRecord } from "../lib/history";
 import { explorerTxUrl } from "../lib/config";
-import { formatUsd, shortenAddress } from "../lib/format";
+import { formatUsd, shortenAddress, shortenHash } from "../lib/format";
 
 interface Props {
   draws: DrawRecord[];
@@ -47,14 +47,25 @@ export default function LiveDrawFeed({ draws }: Props) {
                     {formatUsd(d.prize)}
                   </div>
                 )}
-                <a
-                  href={explorerTxUrl(d.txHash)}
-                  target="_blank"
-                  rel="noopener noreferrer"
-                  className="text-xs text-aqua-300 hover:text-aqua-200"
-                >
-                  View tx ↗
-                </a>
+                {d.roll !== "0" && (
+                  <div className="text-xs text-slate-500">
+                    roll {d.roll}
+                  </div>
+                )}
+                {d.txHash ? (
+                  <a
+                    href={explorerTxUrl(d.txHash)}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="text-xs text-aqua-300 hover:text-aqua-200"
+                  >
+                    {shortenHash(d.txHash)} ↗
+                  </a>
+                ) : (
+                  <span className="text-xs italic text-slate-600">
+                    unverified on-chain
+                  </span>
+                )}
               </div>
             </li>
           ))}

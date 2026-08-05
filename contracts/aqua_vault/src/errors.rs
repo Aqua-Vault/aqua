@@ -27,4 +27,8 @@ pub enum AquaError {
     InvalidConfig = 8,
     /// Only the admin may perform this action.
     Unauthorized = 9,
+    /// The contract is already inside a multi-step external interaction and a
+    /// re-entrant call into the vault was attempted. The caller must not
+    /// re-enter the vault while a draw (or other locked operation) is running.
+    Reentrancy = 10,
 }
