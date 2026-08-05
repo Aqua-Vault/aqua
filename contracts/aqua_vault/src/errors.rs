@@ -49,4 +49,10 @@ pub enum AquaError {
     /// re-entrant call into the vault was attempted. The caller must not
     /// re-enter the vault while a draw (or other locked operation) is running.
     Reentrancy = 10,
+    /// The vault is paused: deposits and draws are blocked (withdrawals are
+    /// always allowed so users can always exit).
+    Paused = 11,
+    /// A deposit would push the caller's standing balance above the admin-set
+    /// per-user cap.
+    RateLimitExceeded = 12,
 }

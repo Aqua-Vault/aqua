@@ -34,6 +34,7 @@
 //!   elapses; anyone may trigger one once `draw_interval` seconds have passed.
 
 mod blend_adapter;
+mod draw;
 mod errors;
 mod events;
 mod storage;
@@ -41,6 +42,7 @@ mod storage;
 use blend_adapter::clients as pool;
 use soroban_sdk::{contract, contractimpl, contracttype, token, Address, Env, Vec};
 
+use draw::select_weighted_winner;
 pub use errors::AquaError;
 pub use storage::{DataKey, VaultStats};
 
@@ -60,6 +62,18 @@ pub struct DrawOutcome {
     pub total_weight: i128,
     /// The depositors considered, in weight-accumulation order.
     pub participants: Vec<Address>,
+}
+
+/// Result of an `execute_prize_draw` cycle. A draw either awards the full
+/// accrued yield to a single depositor ([`DrawResult::Awarded`]) or completes
+/// without a prize because there was nothing to award ([`DrawResult::Skipped`]).
+/// A skipped cycle still advances the draw timer and emits `aqua_draw_skipped`,
+/// so callers never see a dead-end "draw ready" state that always reverts.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DrawResult {
+    Awarded(DrawOutcome),
+    Skipped,
 }
 
 #[contract]
@@ -112,14 +126,34 @@ impl AquaVault {
     /// **before** any external token/pool call, so a malicious yield pool that
     /// re-enters the vault mid-transfer observes already-consistent state and
     /// can never double-credit an account.
+    ///
+    /// When the admin has set a per-user deposit cap
+    /// ([`set_max_deposit_per_interval`]), a deposit that would push the
+    /// caller's *standing balance* above the cap reverts with
+    /// [`AquaError::RateLimitExceeded`]. New deposits are also rejected while
+    /// the pause circuit breaker is engaged ([`AquaError::Paused`]).
     pub fn deposit(e: Env, from: Address, amount: i128) -> core::result::Result<i128, AquaError> {
         from.require_auth();
         storage::guard_initialized(&e)?;
         if storage::is_locked(&e) {
             return Err(AquaError::Reentrancy);
         }
+        if storage::is_paused(&e) {
+            return Err(AquaError::Paused);
+        }
         if amount <= 0 {
             return Err(AquaError::AmountMustBePositive);
+        }
+
+        // Anti-whale throttle: cap bounds the user's standing balance, not
+        // cumulative deposits over time, so semantics stay simple and
+        // withdrawals are never affected.
+        let cap = storage::max_deposit_per_interval(&e);
+        if cap > 0 {
+            let current = storage::user_balance(&e, &from);
+            if amount.saturating_add(current) > cap {
+                return Err(AquaError::RateLimitExceeded);
+            }
         }
 
         // 1. internal accounting (CEI: effects before interactions)
@@ -148,6 +182,9 @@ impl AquaVault {
     /// Also follows Checks-Effects-Interactions: the principal is deducted
     /// from internal accounting before the pool/token transfer, so re-entrant
     /// withdrawals observe up-to-date balances and cannot be double-credited.
+    ///
+    /// Deliberately **not** gated by the pause circuit breaker: users must
+    /// always be able to exit, even (especially) during an incident.
     pub fn withdraw(e: Env, from: Address, amount: i128) -> core::result::Result<i128, AquaError> {
         from.require_auth();
         storage::guard_initialized(&e)?;
@@ -194,10 +231,18 @@ impl AquaVault {
     /// a re-entrancy `Locked` flag: a malicious pool that calls back into the
     /// vault mid-draw hits the [`AquaError::Reentrancy`] guard instead of
     /// reading half-updated state or running a second draw.
-    pub fn execute_prize_draw(e: Env) -> core::result::Result<DrawOutcome, AquaError> {
+    ///
+    /// If no positive yield is available this cycle, the draw is **skipped**
+    /// rather than reverting: the timer is re-armed to a full interval and an
+    /// `aqua_draw_skipped` event is emitted, returning [`DrawResult::Skipped`].
+    /// The draw is also halted while the pause circuit breaker is engaged.
+    pub fn execute_prize_draw(e: Env) -> core::result::Result<DrawResult, AquaError> {
         storage::guard_initialized(&e)?;
         if storage::is_locked(&e) {
             return Err(AquaError::Reentrancy);
+        }
+        if storage::is_paused(&e) {
+            return Err(AquaError::Paused);
         }
 
         if !storage::can_draw(&e) {
@@ -217,7 +262,12 @@ impl AquaVault {
         let pool_value = pool::pool_balance(&e, &yp, &asset, &vault);
         let yield_amount = pool_value.saturating_sub(total);
         if yield_amount <= 0 {
-            return Err(AquaError::NoYieldToAward);
+            // Skipped cycle: re-arm the timer so the next draw is eligible a
+            // fresh interval from now, and signal the skip on-chain instead of
+            // wedging the cycle in a perpetual "draw ready" state.
+            storage::set_last_draw_time(&e, e.ledger().timestamp());
+            events::draw_skipped(&e, total, events::SKIP_REASON_NO_YIELD);
+            return Ok(DrawResult::Skipped);
         }
 
         // Lock the vault while the draw's external interactions are in flight.
@@ -236,11 +286,11 @@ impl AquaVault {
         storage::set_last_draw_time(&e, e.ledger().timestamp());
         events::prize_awarded(&e, &outcome.winner, yield_amount, outcome.roll);
 
-        Ok(outcome)
+        Ok(DrawResult::Awarded(outcome))
     }
 
     /// Public stats view: total locked, live yield, seconds until next draw,
-    /// and the (capped) participant list.
+    /// the (capped) participant list, and the pause state.
     pub fn get_vault_stats(e: Env) -> core::result::Result<VaultStats, AquaError> {
         storage::guard_initialized(&e)?;
         let asset = storage::asset(&e);
@@ -252,7 +302,10 @@ impl AquaVault {
         let yield_amount = pool_value.saturating_sub(total).max(0);
 
         let interval = storage::draw_interval(&e);
-        let elapsed = e.ledger().timestamp().saturating_sub(storage::last_draw_time(&e));
+        let elapsed = e
+            .ledger()
+            .timestamp()
+            .saturating_sub(storage::last_draw_time(&e));
         let seconds_until_next_draw = interval.saturating_sub(elapsed);
 
         let mut participants: Vec<Address> = Vec::new(&e);
@@ -265,6 +318,7 @@ impl AquaVault {
             current_yield: yield_amount,
             seconds_until_next_draw,
             participants,
+            paused: storage::is_paused(&e),
         })
     }
 
@@ -279,53 +333,60 @@ impl AquaVault {
         storage::guard_initialized(&e)?;
         Ok(storage::user_balance(&e, &user))
     }
-}
 
-/// Weighted random selection over all current depositors using the on-chain
-/// PRNG. A depositor's probability of winning is exactly
-/// `balance / total_deposits`. Kept separate from the environment-mutating API
-/// so it can be unit tested directly with a seeded PRNG.
-fn select_weighted_winner(e: &Env) -> DrawOutcome {
-    let mut total: i128 = 0;
-    let mut weighted: Vec<(Address, i128)> = Vec::new(e);
+    /// Current per-user deposit cap (`0` = unlimited).
+    pub fn get_max_deposit_per_interval(e: Env) -> core::result::Result<i128, AquaError> {
+        storage::guard_initialized(&e)?;
+        Ok(storage::max_deposit_per_interval(&e))
+    }
 
-    for addr in storage::depositors(e).iter() {
-        let bal = storage::user_balance(e, &addr);
-        if bal > 0 {
-            total = total.saturating_add(bal);
-            weighted.push_back((addr, total));
+    /// Emergency circuit breaker: halt new deposits and draws. Withdrawals
+    /// remain open so every depositor can exit with full principal.
+    pub fn pause(e: Env) -> core::result::Result<(), AquaError> {
+        storage::guard_initialized(&e)?;
+        let admin = storage::admin(&e);
+        admin.require_auth();
+        if storage::is_paused(&e) {
+            return Ok(());
         }
+        storage::set_paused(&e, true);
+        events::paused(&e, &admin);
+        Ok(())
     }
 
-    debug_assert!(total > 0, "caller must guard total > 0 before selecting");
-
-    // u64 roll over [0, total), then pick the depositor whose cumulative upper
-    // bound first exceeds the roll.
-    let roll: u64 = e.prng().gen_range(0..(total as u64));
-    let mut winner = weighted.first().unwrap().0.clone();
-    for (addr, cumulative) in weighted.iter() {
-        if (roll as i128) < cumulative {
-            winner = addr.clone();
-            break;
+    /// Disengage the emergency circuit breaker.
+    pub fn unpause(e: Env) -> core::result::Result<(), AquaError> {
+        storage::guard_initialized(&e)?;
+        let admin = storage::admin(&e);
+        admin.require_auth();
+        if !storage::is_paused(&e) {
+            return Ok(());
         }
+        storage::set_paused(&e, false);
+        events::unpaused(&e, &admin);
+        Ok(())
     }
 
-    let mut participants: Vec<Address> = Vec::new(e);
-    for (addr, _) in weighted.iter() {
-        participants.push_back(addr.clone());
-    }
-
-    DrawOutcome {
-        winner,
-        roll,
-        total_weight: total,
-        participants,
+    /// Configure the per-user standing-balance cap (anti-whale). `None` clears
+    /// the cap back to unlimited (`0`). Admin-only.
+    pub fn set_max_deposit_per_interval(
+        e: Env,
+        amount: Option<i128>,
+    ) -> core::result::Result<(), AquaError> {
+        storage::guard_initialized(&e)?;
+        let admin = storage::admin(&e);
+        admin.require_auth();
+        let cap = amount.unwrap_or(0);
+        if cap < 0 {
+            return Err(AquaError::InvalidConfig);
+        }
+        storage::set_max_deposit_per_interval(&e, cap);
+        Ok(())
     }
 }
 
 #[cfg(feature = "testutils")]
 mod test;
-
 #[cfg(feature = "testutils")]
 mod test_draw;
 

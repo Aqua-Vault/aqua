@@ -1,27 +1,18 @@
 import { useState } from "react";
-import { executePrizeDraw } from "../lib/contract";
+import { decodeDrawResult, executePrizeDraw } from "../lib/contract";
 import { recordDraw } from "../lib/history";
 
 interface Props {
   publicKey: string | null;
   canDraw: boolean;
+  paused: boolean;
   onDrawComplete: () => void;
-}
-
-// Decode the DrawOutcome struct returned by execute_prize_draw. The prize
-// amount isn't in the struct, so we surface the roll + winner and let the
-// feed pull the prize from the emitted event / stats refresh.
-function parseOutcome(ret: any): { winner: string; roll: string } | null {
-  if (!ret) return null;
-  const winner = ret.winner ?? ret[0];
-  const roll = ret.roll ?? ret[1];
-  if (!winner) return null;
-  return { winner: String(winner), roll: roll != null ? String(roll) : "0" };
 }
 
 export default function AdminPanel({
   publicKey,
   canDraw,
+  paused,
   onDrawComplete,
 }: Props) {
   const [busy, setBusy] = useState(false);
@@ -38,22 +29,30 @@ export default function AdminPanel({
     setMsg(null);
     try {
       const res = await executePrizeDraw();
-      const outcome = parseOutcome(res.returnValue);
-      if (outcome) {
+      const draw = decodeDrawResult(res.returnValue);
+      if (draw?.tag === "Awarded") {
+        const outcome = draw.values[0];
+        // The prize amount isn't in the struct; surface the roll + winner and
+        // let the feed pull the prize from the emitted event / stats refresh.
         recordDraw({
           winner: outcome.winner,
-          prize: "0", // refreshed from stats; struct omits prize amount
-          roll: outcome.roll,
+          prize: "0",
+          roll: String(outcome.roll),
           txHash: res.hash,
           timestamp: Date.now(),
         });
+        setMsg({
+          kind: "ok",
+          text: `Draw executed! Winner: ${outcome.winner.slice(0, 6)}…`,
+        });
+      } else if (draw?.tag === "Skipped") {
+        setMsg({
+          kind: "ok",
+          text: "No yield this round — draw skipped and timer re-armed.",
+        });
+      } else {
+        setMsg({ kind: "ok", text: "Draw executed!" });
       }
-      setMsg({
-        kind: "ok",
-        text: `Draw executed! Winner: ${
-          outcome ? outcome.winner.slice(0, 6) + "…" : "see feed"
-        }`,
-      });
       onDrawComplete();
     } catch (err: any) {
       setMsg({ kind: "err", text: err?.message || "Draw failed" });
@@ -76,14 +75,19 @@ export default function AdminPanel({
         the interval elapses; the admin can force it early for demos.
       </p>
 
-      {!canDraw && (
+      {!canDraw && paused && (
+        <p className="mt-2 text-xs text-amber-300/80">
+          The vault is paused — draws are disabled until the admin unpauses.
+        </p>
+      )}
+
+      {!canDraw && !paused && (
         <p className="mt-2 text-xs text-amber-300/80">
           The draw interval hasn&apos;t elapsed yet — this may revert with{" "}
           <code className="font-mono">TooEarly</code> unless you&apos;re the
           admin.
         </p>
       )}
-
       <button
         className="btn-primary mt-4 w-full bg-amber-500 hover:bg-amber-400 active:bg-amber-600"
         onClick={handleDraw}
