@@ -1,3 +1,21 @@
+//! # Events
+//!
+//! Aqua publishes four contract-level events. Each is a two-field Soroban
+//! `publish(topic, data)` where the **topic** is the event name plus indexed
+//! filters and the **data** carries the payload:
+//!
+//! | Topic | Topic payload | Data payload |
+//! | --- | --- | --- |
+//! | `aqua_initialized` | `(Symbol, admin, asset, pool)` | `interval: u64` |
+//! | `aqua_deposit` | `(Symbol, from)` | `(amount, new_balance): (i128, i128)` |
+//! | `aqua_withdraw` | `(Symbol, from)` | `(amount, new_balance): (i128, i128)` |
+//! | `aqua_prize_awarded` | `(Symbol, winner)` | `(prize_amount, roll): (i128, u64)` |
+//!
+//! Indexers should subscribe on the `Symbol` first field (the topic name) and
+//! read the remaining topic fields as filters (`from` / `winner` / config
+//! addresses). The `roll` in `aqua_prize_awarded` lets any observer reproduce
+//! the weighted selection on-chain.
+
 use soroban_sdk::{Address, Env, Symbol};
 
 /// Contract-level event topics. Symbols are built at call time because

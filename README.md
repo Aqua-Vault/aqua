@@ -4,6 +4,18 @@ A complete end-to-end MVP for prize-linked savings on Stellar. Deposit USDC into
 
 ## Architecture
 
+```mermaid
+flowchart LR
+    U[User] -- "USDC deposit" --> V[Aqua Vault]
+    V -- "forward principal" --> YP[Yield Pool<br/>Blend / mock_pool]
+    YP -- "pooled yield" --> V
+    RNG[env.prng<br/>CAP-0074] -- "weighted roll" --> V
+    V -- "prize (100% of yield)" --> W[Winner]
+    V -- "withdraw principal" --> U
+```
+
+Deposits flow **user → vault → yield pool** and start earning immediately; the draw period ends with the vault pulling the accrued **yield pool → vault** and paying it out as a **prize → winner**, who is selected by a weighted `env.prng()` roll. Principal is always withdrawable **vault → user** in full.
+
 - **Smart Contract** (`contracts/aqua_vault`): Soroban vault managing deposits, yield routing, and weighted-random prize draws using `Env::prng()` (CAP-0074). Written in Rust with soroban-sdk 27.0.5.
 - **Mock Pool** (`contracts/mock_pool`): Deployable stand-in for Blend with simple-interest accrual, allowing testnet deployment without external dependencies.
 - **Frontend** (`frontend/`): Next.js + Tailwind responsive UI with Freighter wallet integration, deposit/withdraw actions, live countdown, and draw history.
@@ -34,7 +46,7 @@ make build
 # Run all unit tests (vault + mock pool)
 make test
 
-# Run only vault tests (14 tests including statistical PRNG checks)
+# Run only vault tests (17 tests incl. statistical + fuzz checks)
 make test-vault
 
 # Run only mock pool tests
@@ -42,8 +54,26 @@ make test-pool
 ```
 
 **Test highlights:**
-- `test.rs` includes 14 comprehensive tests: initialization, deposit/withdraw flows, authorization, prize draws with proportional probability verification (6000-iteration statistical test), zero-yield edge case, and error paths.
-- All tests pass with soroban-sdk 27.0.5.
+- `test.rs` includes 15 comprehensive tests: initialization, deposit/withdraw flows, authorization, prize draws with proportional probability verification (6000-iteration statistical test), zero-yield edge case, and error paths.
+- `test_draw.rs` runs 2,000 consecutive full prize draws across 8 depositors and asserts the win distribution converges to each balance's share of principal (±2%), plus zero-loss on total exit.
+- `fuzz_test.rs` drives 1,002 deterministic pseudo-random actions (deposits, withdrawals, draws, rate changes) across 3 seeds, re-asserting the storage invariants after every step.
+- All 22 tests (vault + pool) pass with soroban-sdk 27.0.5.
+
+**WASM size guardrail:**
+```bash
+# Build both contracts as optimized WASM and print a size report
+make wasm-size
+# or, with a baseline for delta comparison (e.g. a base-branch build):
+scripts/analyze_wasm.sh --baseline /path/to/base/target
+```
+The analyzer prints raw + gzipped artifact sizes and a top-sections breakdown (via `wasm-tools objdump`), then fails the build if any artifact exceeds the thresholds:
+
+| Threshold | Default | Meaning |
+| --- | --- | --- |
+| `MAX_WASM_KB` | `200` | Hard cap per artifact. Soroban's ledger class-size limit is 2 MB; 200 KB catches accidental bloat early. |
+| `MAX_WASM_DELTA_KB` | `15` | Allowed growth vs a baseline build (used with `--baseline`), blocking silent size regressions. |
+
+CI runs this check on every PR (`contract-wasm-size` job), comparing against a baseline build of the base branch, so a PR that adds an expensive dependency fails visibly before merge. Raw size is what gets charged against the class-size limit and drives upload/storage fees; gzipped size is a proxy for upload cost; the `code` section grows with every helper and panic string.
 
 ## Deploy to Testnet
 
@@ -165,6 +195,46 @@ let roll = e.prng().gen_range(0..total);  // uniform [0, total)
 // Iterate depositors, accumulate balances; winner is the address whose cumulative range contains `roll`.
 ```
 
+## Reference
+
+### Storage keys
+
+| Key | Type | Tier |
+| --- | --- | --- |
+| `Admin` | `Address` | instance |
+| `Asset` | `Address` | instance |
+| `YieldPool` | `Address` | instance |
+| `DrawInterval` | `u64` | instance |
+| `LastDrawTime` | `u64` | instance |
+| `TotalDeposits` | `i128` | instance |
+| `UserBalance(Address)` | `i128` | persistent |
+| `Depositors` | `Vec<Address>` | persistent |
+
+Singleton configuration and aggregate accounting live in instance storage (cheap hot reads); per-user balances and the ordered depositor registry live in persistent storage because they scale with adoption.
+
+### Events
+
+| Topic | Topic payload | Data payload |
+| --- | --- | --- |
+| `aqua_initialized` | `(Symbol, admin, asset, pool)` | `interval: u64` |
+| `aqua_deposit` | `(Symbol, from)` | `(amount, new_balance): (i128, i128)` |
+| `aqua_withdraw` | `(Symbol, from)` | `(amount, new_balance): (i128, i128)` |
+| `aqua_prize_awarded` | `(Symbol, winner)` | `(prize_amount, roll): (i128, u64)` |
+
+### `AquaError` codes
+
+| Code | Variant | Condition |
+| --- | --- | --- |
+| 1 | `AlreadyInitialized` | `initialize` called more than once |
+| 2 | `NotInitialized` | mutating/ledger call before `initialize` |
+| 3 | `AmountMustBePositive` | deposit/withdraw amount is zero or negative |
+| 4 | `InsufficientBalance` | withdraw exceeds the caller's principal |
+| 5 | `TooEarly` | draw attempted before the interval elapses |
+| 6 | `NoDepositors` | no user holds positive principal |
+| 7 | `NoYieldToAward` | current yield is not positive |
+| 8 | `InvalidConfig` | `draw_interval` configured as zero |
+| 9 | `Unauthorized` | non-admin calls an admin-only action |
+
 ## Project Structure
 
 ```
@@ -210,7 +280,7 @@ aqua/
 - **Verifiable randomness**: CAP-0074 on-chain PRNG — every draw result is auditable on-chain.
 - **Yield routing**: Deposits instantly forwarded to Blend (or mock pool) to start earning.
 - **Financial inclusion focus**: No minimum deposit, no lock-ups, earn yield passively while having a shot at the prize.
-- **Comprehensive tests**: 14 vault tests (including 6000-iteration statistical proportionality check) + 5 pool tests, all passing.
+- **Comprehensive tests**: 15 vault unit tests (including a 6000-iteration statistical proportionality check), a 2,000-draw multi-user convergence test, a 1,000+ action deterministic fuzz test, and 5 pool tests — all passing.
 
 ## Next Steps
 

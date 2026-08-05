@@ -12,6 +12,20 @@
 //!   * `deposit`  -> Blend `Pool::submit`
 //!   * `withdraw` -> Blend `Pool::redeem`
 //!   * `balance`  -> Blend `Pool::get_withdrawable` + borrow value
+//!
+//! ## Yield-source mapping
+//!
+//! The vault never hard-codes a pool; `storage::YieldPool` points at whichever
+//! contract implements this interface:
+//!
+//! | Aqua role | `mock_pool` (testnet) | Blend (mainnet) |
+//! | --- | --- | --- |
+//! | supply principal | `deposit` (records, accrues) | `Pool::submit` |
+//! | redeem principal/yield | `withdraw` (transfers out) | `Pool::redeem` |
+//! | value of vault's position | `balance` (token balance) | withdrawable + borrow value |
+//!
+//! `MockYieldPool` exposes the extra configuration calls the mock needs
+//! (`initialize`, `set_rate`) that do not exist on Blend.
 
 use soroban_sdk::{contractclient, token, Address, Env};
 
@@ -49,8 +63,16 @@ pub trait MockYieldPool {
     /// Set the gross annual interest rate in basis points (10_000 = 100%/yr).
     fn set_rate(env: Env, bps: u64);
 
+    /// Record `amount` of `asset` as freshly supplied principal (same role as
+    /// [`YieldPool::deposit`]).
     fn deposit(env: Env, asset: Address, amount: i128) -> i128;
+
+    /// Redeem principal and deliver it *to* `to` (same role as
+    /// [`YieldPool::withdraw`]).
     fn withdraw(env: Env, asset: Address, to: Address, amount: i128) -> i128;
+
+    /// Current withdrawable value for `owner` in `asset` (same role as
+    /// [`YieldPool::balance`]).
     fn balance(env: Env, asset: Address, owner: Address) -> i128;
 }
 

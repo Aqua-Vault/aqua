@@ -1,9 +1,41 @@
 #![no_std]
 #![allow(clippy::redundant_else)]
 
+//! # Aqua Vault
+//!
+//! A no-loss prize-linked savings vault for Stellar (Soroban, soroban-sdk
+//! 27.0.5). Users deposit a stablecoin into a shared vault; the vault forwards
+//! the principal into a yield pool (Blend, or the bundled `mock_pool`); and
+//! each draw period 100% of the pooled yield is awarded to a single depositor
+//! selected by weighted randomness. Principal is always withdrawable in full.
+//!
+//! ## Flow
+//!
+//! ```text
+//! User --USDC--> Vault --deposit--> YieldPool
+//! YieldPool --yield--> Vault --prize--> Winner
+//! ```
+//!
+//! ## Modules
+//!
+//! * `storage` — persistent vs instance storage layout, `DataKey` variants,
+//!   and the depositor registry that supplies draw weights.
+//! * `events` — event topics and payload shapes (`aqua_*`).
+//! * `errors` — `AquaError` codes and when each fires.
+//! * `blend_adapter` — the swappable yield-pool integration layer.
+//!
+//! ## Design notes
+//!
+//! * **Zero-loss**: a withdraw is capped at the caller's recorded principal, so
+//!   prize payouts can never reduce anyone's balance.
+//! * **Weighted draw**: each depositor's win probability equals their share of
+//!   `total_deposits`, using the CAP-0074 on-chain PRNG (`env.prng()`).
+//! * **Admin escape hatch**: the admin may force a draw before the interval
+//!   elapses; anyone may trigger one once `draw_interval` seconds have passed.
+
 mod blend_adapter;
-mod events;
 mod errors;
+mod events;
 mod storage;
 
 use blend_adapter::clients as pool;
@@ -20,9 +52,13 @@ pub(crate) const MAX_DEPOSITORS_DETAIL: usize = 100;
 #[contracttype]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DrawOutcome {
+    /// The depositor whose cumulative weight range contained the PRNG roll.
     pub winner: Address,
+    /// Raw `env.prng()` value used for the selection (auditable on-chain).
     pub roll: u64,
+    /// Sum of all depositor balances at selection time.
     pub total_weight: i128,
+    /// The depositors considered, in weight-accumulation order.
     pub participants: Vec<Address>,
 }
 
@@ -201,12 +237,13 @@ impl AquaVault {
         })
     }
 
-    /// Read helpers for integration testers / audits.
+    /// The contract's admin address.
     pub fn get_admin(e: Env) -> core::result::Result<Address, AquaError> {
         storage::guard_initialized(&e)?;
         Ok(storage::admin(&e))
     }
 
+    /// A single depositor's current principal balance.
     pub fn get_user_balance(e: Env, user: Address) -> core::result::Result<i128, AquaError> {
         storage::guard_initialized(&e)?;
         Ok(storage::user_balance(&e, &user))
@@ -257,3 +294,9 @@ fn select_weighted_winner(e: &Env) -> DrawOutcome {
 
 #[cfg(feature = "testutils")]
 mod test;
+
+#[cfg(feature = "testutils")]
+mod test_draw;
+
+#[cfg(feature = "testutils")]
+mod fuzz_test;
