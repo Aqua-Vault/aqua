@@ -1,6 +1,7 @@
 import { useMemo, useState } from "react";
 import { deposit, withdraw } from "../lib/contract";
 import { fromStroops, toStroops, formatUsd } from "../lib/format";
+import { useToast } from "./Toast";
 
 interface Props {
   publicKey: string | null;
@@ -30,6 +31,7 @@ export default function ActionPanel({
   const [msg, setMsg] = useState<{ kind: "ok" | "err"; text: string } | null>(
     null,
   );
+  const toast = useToast();
 
   const max = tab === "deposit" ? usdcBalance : userBalance;
   const depositBlocked = paused && tab === "deposit";
@@ -76,7 +78,9 @@ export default function ActionPanel({
       onAmountChange("");
       onDone();
     } catch (err: any) {
-      setMsg({ kind: "err", text: err?.message || "Transaction failed" });
+      const message = err?.message || "Transaction failed";
+      setMsg({ kind: "err", text: message });
+      toast.push({ op: tab === "deposit" ? "deposit" : "withdraw", state: "failed", message });
     } finally {
       setBusy(false);
     }
@@ -108,7 +112,7 @@ export default function ActionPanel({
       <label className="mb-2 flex items-center justify-between text-sm text-slate-400">
         <span>Amount (USDC)</span>
         <button
-          className="text-aqua-300 hover:text-aqua-200"
+          className="-mx-1.5 flex min-h-[44px] items-center rounded-md px-1.5 text-aqua-300 transition hover:text-aqua-200 focus:outline-none focus-visible:ring-2 focus-visible:ring-aqua-400/60"
           onClick={() => onAmountChange(fromStroops(max, 7))}
           type="button"
         >

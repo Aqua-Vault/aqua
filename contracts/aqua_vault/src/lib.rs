@@ -38,9 +38,10 @@ mod draw;
 mod errors;
 mod events;
 mod storage;
+mod yield_trait;
 
-use blend_adapter::clients as pool;
 use soroban_sdk::{contract, contractimpl, contracttype, token, Address, Env, Vec};
+use yield_trait::{YieldSourceKind, yield_source};
 
 use draw::select_weighted_winner;
 pub use errors::AquaError;
@@ -107,6 +108,7 @@ impl AquaVault {
         storage::set_admin(&e, &admin);
         storage::set_asset(&e, &asset);
         storage::set_yield_pool(&e, &yield_pool);
+        storage::set_yield_source_kind(&e, YieldSourceKind::Mock);
         storage::set_draw_interval(&e, interval);
         storage::set_last_draw_time(&e, e.ledger().timestamp());
         storage::set_total_deposits(&e, 0);
@@ -170,7 +172,7 @@ impl AquaVault {
         token::Client::new(&e, &asset).transfer(&from, &vault, &amount);
 
         // 3. vault -> yield pool (accrues interest from now on)
-        pool::pool_deposit(&e, &yp, &asset, &vault, amount);
+        yield_source::deposit(&e, &yp, &asset, &vault, amount);
 
         events::deposited(&e, &from, amount, prev + amount);
         Ok(prev + amount)
@@ -210,7 +212,7 @@ impl AquaVault {
         let yp = storage::yield_pool(&e);
 
         // 2. pull principal back out of the pool into the vault
-        pool::pool_withdraw(&e, &yp, &asset, &vault, amount);
+        yield_source::withdraw(&e, &yp, &asset, &vault, amount);
 
         // 3. vault -> user
         token::Client::new(&e, &asset).transfer(&vault, &from, &amount);
@@ -230,12 +232,15 @@ impl AquaVault {
     /// The multi-step prize path (pool redeem → winner transfer) is guarded by
     /// a re-entrancy `Locked` flag: a malicious pool that calls back into the
     /// vault mid-draw hits the [`AquaError::Reentrancy`] guard instead of
-    /// reading half-updated state or running a second draw.
+    /// reading half-updated state or running a second draw. The draw is also
+    /// halted while the pause circuit breaker is engaged.
     ///
-    /// If no positive yield is available this cycle, the draw is **skipped**
-    /// rather than reverting: the timer is re-armed to a full interval and an
-    /// `aqua_draw_skipped` event is emitted, returning [`DrawResult::Skipped`].
-    /// The draw is also halted while the pause circuit breaker is engaged.
+    /// The payout is fault-tolerant against imperfect yield pools: only the
+    /// pool's *real* withdrawable yield is attempted, and if the redeem
+    /// partial-fills the winner is paid exactly what was received (never more
+    /// than the vault physically holds). If no yield is reachable at all, the
+    /// cycle is skipped gracefully (event emitted, interval advanced) rather
+    /// than reverting forever.
     pub fn execute_prize_draw(e: Env) -> core::result::Result<DrawResult, AquaError> {
         storage::guard_initialized(&e)?;
         if storage::is_locked(&e) {
@@ -259,7 +264,7 @@ impl AquaVault {
         }
 
         // Yield = whatever value the pool has beyond principal.
-        let pool_value = pool::pool_balance(&e, &yp, &asset, &vault);
+        let pool_value = yield_source::balance(&e, &yp, &asset, &vault);
         let yield_amount = pool_value.saturating_sub(total);
         if yield_amount <= 0 {
             // Skipped cycle: re-arm the timer so the next draw is eligible a
@@ -277,14 +282,41 @@ impl AquaVault {
 
         // Draw the weighted winner via the CAP-0074 on-chain PRNG.
         let outcome = select_weighted_winner(&e);
-        pool::pool_withdraw(&e, &yp, &asset, &vault, yield_amount);
-        token::Client::new(&e, &asset).transfer(&vault, &outcome.winner, &yield_amount);
 
-        // Release the guard before returning.
+        // Cap the attempt at what the pool can actually return. A healthy pool
+        // reports withdrawable == balance; a pool with borrower shortfalls
+        // reports less, and we must never try to redeem more than is reachable.
+        let reachable_yield = yield_source::withdrawable(&e, &yp, &asset, &vault)
+            .saturating_sub(total);
+        let requested = yield_amount.min(reachable_yield);
+
+        if requested <= 0 {
+            // No reachable yield: skip the cycle instead of dead-ending on a
+            // half-broken pool. The next draw stays a full interval away.
+            storage::set_locked(&e, false);
+            storage::set_last_draw_time(&e, e.ledger().timestamp());
+            events::prize_skipped(&e, &outcome.winner, outcome.roll);
+            return Ok(DrawResult::Skipped);
+        }
+
+        // Redeem and pay only what was actually received (the pool may
+        // partial-fill a redeem even when withdrawable looked healthy).
+        let received = yield_source::withdraw(&e, &yp, &asset, &vault, requested);
+        let prize = requested.min(received);
+
+        // Release the guard before returning (all external calls are done).
         storage::set_locked(&e, false);
 
+        if prize <= 0 {
+            storage::set_last_draw_time(&e, e.ledger().timestamp());
+            events::prize_skipped(&e, &outcome.winner, outcome.roll);
+            return Ok(DrawResult::Skipped);
+        }
+
+        token::Client::new(&e, &asset).transfer(&vault, &outcome.winner, &prize);
+
         storage::set_last_draw_time(&e, e.ledger().timestamp());
-        events::prize_awarded(&e, &outcome.winner, yield_amount, outcome.roll);
+        events::prize_awarded(&e, &outcome.winner, prize, outcome.roll);
 
         Ok(DrawResult::Awarded(outcome))
     }
@@ -298,7 +330,7 @@ impl AquaVault {
         let yp = storage::yield_pool(&e);
 
         let total = storage::total_deposits(&e);
-        let pool_value = pool::pool_balance(&e, &yp, &asset, &vault);
+        let pool_value = yield_source::balance(&e, &yp, &asset, &vault);
         let yield_amount = pool_value.saturating_sub(total).max(0);
 
         let interval = storage::draw_interval(&e);
@@ -307,6 +339,8 @@ impl AquaVault {
             .timestamp()
             .saturating_sub(storage::last_draw_time(&e));
         let seconds_until_next_draw = interval.saturating_sub(elapsed);
+
+        let annual_rate_bps = yield_source::rate(&e, &yp, &asset);
 
         let mut participants: Vec<Address> = Vec::new(&e);
         for addr in storage::depositors(&e).iter().take(MAX_DEPOSITORS_DETAIL) {
@@ -317,9 +351,29 @@ impl AquaVault {
             total_deposits: total,
             current_yield: yield_amount,
             seconds_until_next_draw,
+            annual_rate_bps,
             participants,
             paused: storage::is_paused(&e),
         })
+    }
+
+    /// Admin-only: switch the vault to a different yield-source adapter kind.
+    /// The `yield_pool` address itself is unchanged; only the adapter mapping
+    /// (and therefore which interface semantics `lib.rs` relies on) switches.
+    /// Deployed vaults that predate this field default to [`YieldSourceKind::Mock`].
+    pub fn set_yield_source_kind(
+        e: Env,
+        kind: YieldSourceKind,
+    ) -> core::result::Result<(), AquaError> {
+        storage::guard_initialized(&e)?;
+        storage::admin(&e).require_auth();
+        storage::set_yield_source_kind(&e, kind);
+        Ok(())
+    }
+
+    /// Read helper for integrations/audits: which adapter is the vault bound to.
+    pub fn get_yield_source_kind(e: Env) -> YieldSourceKind {
+        storage::yield_source_kind(&e)
     }
 
     /// The contract's admin address.

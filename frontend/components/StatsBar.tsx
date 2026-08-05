@@ -1,6 +1,7 @@
 import { VaultStats } from "../lib/contract";
 import { formatUsd } from "../lib/format";
 import CountdownTimer from "./CountdownTimer";
+import { useYieldPreview } from "../hooks/useYieldPreview";
 
 interface Props {
   stats: VaultStats | null;
@@ -12,6 +13,8 @@ export default function StatsBar({ stats, ledgerCloseMs, loading }: Props) {
   const prize = stats?.currentYield ?? BigInt(0);
   const tvl = stats?.totalDeposits ?? BigInt(0);
   const participants = stats?.participants.length ?? 0;
+  const preview = useYieldPreview(stats);
+  const showApy = !preview.loading && preview.apyPct !== "0.00";
 
   return (
     <div className="grid grid-cols-1 gap-4 sm:grid-cols-3">
@@ -25,6 +28,11 @@ export default function StatsBar({ stats, ledgerCloseMs, loading }: Props) {
           </div>
           <div className="mt-1 text-xs text-slate-400">
             100% of yield · winner takes all
+            {showApy && (
+              <span className="ml-2 rounded-full bg-emerald-500/15 px-2 py-0.5 text-emerald-300">
+                APY ~{preview.apyPct}%
+              </span>
+            )}
           </div>
         </div>
       </div>

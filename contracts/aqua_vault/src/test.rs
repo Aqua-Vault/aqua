@@ -19,6 +19,7 @@ use soroban_sdk::{
 
 use crate::storage;
 use crate::storage::{PERSISTENT_TTL_EXTEND_THRESHOLD, PERSISTENT_TTL_EXTEND_TO};
+use crate::yield_trait::YieldSourceKind;
 use crate::{
     select_weighted_winner, AquaError, AquaVault, AquaVaultClient, DataKey, DrawOutcome, DrawResult,
 };
@@ -83,6 +84,20 @@ impl MockYieldPool {
         accrue(&e);
         token::Client::new(&e, &token).balance(&e.current_contract_address())
     }
+
+    pub fn withdrawable(e: Env, asset: Address, _owner: Address) -> i128 {
+        // This mock is always fully withdrawable: same as its live balance.
+        let token: Address = e.storage().instance().get(&MockKey::Token).unwrap();
+        assert!(asset == token);
+        accrue(&e);
+        token::Client::new(&e, &token).balance(&e.current_contract_address())
+    }
+
+    pub fn rate(e: Env, asset: Address) -> u64 {
+        let token: Address = e.storage().instance().get(&MockKey::Token).unwrap();
+        assert!(asset == token);
+        e.storage().instance().get(&MockKey::RateBps).unwrap()
+    }
 }
 
 /// Simple-interest accrual on the pool's live token balance. Because Aqua
@@ -104,6 +119,91 @@ fn accrue(e: &Env) {
         }
     }
     e.storage().instance().set(&MockKey::LastTs, &now);
+}
+
+// ---------------------------------------------------------------------------
+// ShortfallPool — partial-fill / borrow-shortfall simulation
+// ---------------------------------------------------------------------------
+
+/// An imperfect pool: it reports its full accrued balance, but (a) its
+/// `withdrawable` is capped below the reported balance (simulating a borrower
+/// shortfall) and (b) `withdraw` partial-fills, paying only up to `redeem_cap`.
+/// Used to exercise the vault's fault-tolerant prize payout (#13).
+#[contract]
+pub struct ShortfallPool;
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ShortfallKey {
+    Token,
+    LastTs,
+    RateBps,
+    WithdrawableCap,
+    RedeemCap,
+}
+
+#[contractimpl]
+impl ShortfallPool {
+    pub fn initialize(e: Env, token: Address, withdrawable_cap: i128, redeem_cap: i128) {
+        e.storage().instance().set(&ShortfallKey::Token, &token);
+        e.storage().instance().set(&ShortfallKey::LastTs, &e.ledger().timestamp());
+        e.storage().instance().set(&ShortfallKey::RateBps, &1000u64);
+        e.storage().instance().set(&ShortfallKey::WithdrawableCap, &withdrawable_cap);
+        e.storage().instance().set(&ShortfallKey::RedeemCap, &redeem_cap);
+    }
+
+    pub fn deposit(e: Env, asset: Address, amount: i128) -> i128 {
+        let token: Address = e.storage().instance().get(&ShortfallKey::Token).unwrap();
+        assert!(asset == token);
+        accrue_shortfall(&e);
+        amount
+    }
+
+    pub fn withdraw(e: Env, asset: Address, to: Address, amount: i128) -> i128 {
+        let token: Address = e.storage().instance().get(&ShortfallKey::Token).unwrap();
+        assert!(asset == token);
+        accrue_shortfall(&e);
+        let redeem_cap: i128 = e.storage().instance().get(&ShortfallKey::RedeemCap).unwrap();
+        let paid = amount.min(redeem_cap);
+        if paid > 0 {
+            token::Client::new(&e, &token).transfer(&e.current_contract_address(), &to, &paid);
+        }
+        paid
+    }
+
+    pub fn balance(e: Env, asset: Address, _owner: Address) -> i128 {
+        let token: Address = e.storage().instance().get(&ShortfallKey::Token).unwrap();
+        assert!(asset == token);
+        accrue_shortfall(&e);
+        token::Client::new(&e, &token).balance(&e.current_contract_address())
+    }
+
+    pub fn withdrawable(e: Env, asset: Address, _owner: Address) -> i128 {
+        let cap: i128 = e.storage().instance().get(&ShortfallKey::WithdrawableCap).unwrap();
+        Self::balance(e, asset, _owner).min(cap)
+    }
+
+    pub fn rate(e: Env, _asset: Address) -> u64 {
+        e.storage().instance().get(&ShortfallKey::RateBps).unwrap()
+    }
+}
+
+fn accrue_shortfall(e: &Env) {
+    let token: Address = e.storage().instance().get(&ShortfallKey::Token).unwrap();
+    let rate: u64 = e.storage().instance().get(&ShortfallKey::RateBps).unwrap();
+    let last: u64 = e.storage().instance().get(&ShortfallKey::LastTs).unwrap();
+    let now = e.ledger().timestamp();
+    let bal = token::Client::new(e, &token).balance(&e.current_contract_address());
+    if bal > 0 && now > last {
+        let elapsed = now - last;
+        let interest =
+            bal * (rate as i128) * (elapsed as i128) / (10_000i128 * (SECS_PER_YEAR as i128));
+        if interest > 0 {
+            token::StellarAssetClient::new(e, &token)
+                .mint(&e.current_contract_address(), &interest);
+        }
+    }
+    e.storage().instance().set(&ShortfallKey::LastTs, &now);
 }
 
 // ---------------------------------------------------------------------------
@@ -157,6 +257,42 @@ fn setup(rate_bps: u64, interval_secs: u64) -> Setup {
         u2,
         u3,
         mock_pool,
+    }
+}
+
+/// Setup with the partial-fill `ShortfallPool` as the vault's yield pool.
+fn setup_shortfall(withdrawable_cap: i128, redeem_cap: i128) -> Setup {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let u1 = Address::generate(&env);
+    let u2 = Address::generate(&env);
+    let u3 = Address::generate(&env);
+
+    let pool_id = env.register(ShortfallPool, ());
+    let sac = env.register_stellar_asset_contract_v2(pool_id.clone());
+    let token = sac.address();
+    let token_admin = token::StellarAssetClient::new(&env, &token);
+    token_admin.mint(&u1, &1_000_000_000_000i128);
+    token_admin.mint(&u2, &1_000_000_000_000i128);
+
+    ShortfallPoolClient::new(&env, &pool_id).initialize(&token, &withdrawable_cap, &redeem_cap);
+
+    let vault_id = env.register(AquaVault, ());
+    let vault = AquaVaultClient::new(&env, &vault_id);
+    vault.initialize(&admin, &token, &pool_id, &Some(86_400));
+
+    Setup {
+        env,
+        vault,
+        vault_id,
+        token,
+        admin,
+        u1,
+        u2,
+        u3: u3,
+        mock_pool: pool_id,
     }
 }
 
@@ -1001,6 +1137,14 @@ impl ReentrantPool {
         let _ = asset;
         e.storage().instance().get(&RKey::Stored).unwrap_or(0)
     }
+
+    pub fn withdrawable(e: Env, asset: Address, owner: Address) -> i128 {
+        Self::balance(e, asset, owner)
+    }
+
+    pub fn rate(e: Env, _asset: Address) -> u64 {
+        1_000
+    }
 }
 
 fn armed(e: &Env, key: &RKey) -> bool {
@@ -1130,4 +1274,99 @@ fn test_prize_draw_rejects_reentrant_invocation() {
     // frame back), so there is no `aqua_prize_awarded` and no re-armed timer.
     let events = env.events().all().filter_by_contract(&vault_id);
     assert_eq!(events.events().len(), 0, "reverted draw must emit no events");
+}
+
+// ---------------------------------------------------------------------------
+// Yield-source abstraction (#15) + fault-tolerant draws (#13) + rate (#14)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_vault_defaults_to_mock_kind_and_admin_can_switch() {
+    let s = setup(1_000, 86_400);
+    // Fresh vaults default to the mock adapter (testnet deployment).
+    assert_eq!(s.vault.get_yield_source_kind(), YieldSourceKind::Mock);
+
+    // The admin can rebind to a different adapter kind without touching the
+    // pool address or any existing state.
+    s.vault.set_yield_source_kind(&YieldSourceKind::Blend);
+    assert_eq!(s.vault.get_yield_source_kind(), YieldSourceKind::Blend);
+
+    s.vault.set_yield_source_kind(&YieldSourceKind::Custom);
+    assert_eq!(s.vault.get_yield_source_kind(), YieldSourceKind::Custom);
+}
+
+#[test]
+fn test_get_vault_stats_exposes_pool_rate() {
+    let s = setup(2_500, 86_400); // 25%/yr
+    let stats = s.vault.get_vault_stats();
+    assert_eq!(stats.annual_rate_bps, 2_500);
+}
+
+#[test]
+fn test_draw_against_partial_fill_pool_pays_received_amount() {
+    // Balance after one year @10% on 80k principal = 88_000 (yield 8_000).
+    // Withdrawable is capped at 82_000 (only 2_000 reachable) and the redeem
+    // further partial-fills to 1_500. The vault must pay exactly 1_500.
+    let s = setup_shortfall(82_000, 1_500);
+    s.vault.deposit(&s.u1, &40_000);
+    s.vault.deposit(&s.u2, &40_000);
+    let u1_before = token_balance(&s, &s.u1);
+    let u2_before = token_balance(&s, &s.u2);
+
+    advance(&s, SECS_PER_YEAR);
+    let outcome = awarded(s.vault.execute_prize_draw()); // must NOT revert
+
+    let prize = if outcome.winner == s.u1 {
+        token_balance(&s, &s.u1) - u1_before
+    } else if outcome.winner == s.u2 {
+        token_balance(&s, &s.u2) - u2_before
+    } else {
+        panic!("winner must be one of the depositors");
+    };
+    // Only what was actually received is paid out — never more than the vault
+    // physically holds.
+    assert_eq!(prize, 1_500);
+    assert_eq!(s.vault.get_vault_stats().total_deposits, 80_000);
+    // The vault holds no excess after handing the full received amount over.
+    assert_eq!(token_balance(&s, &s.vault_id), 0);
+}
+
+#[test]
+fn test_draw_skips_cycle_when_pool_yield_is_unreachable() {
+    // Balance after one year @10% on 80k principal = 88_000 (yield 8_000),
+    // but the pool can't hand back anything beyond principal (withdrawable
+    // cap == principal). The draw must skip the cycle gracefully instead of
+    // dead-ending, advancing the interval so it never wedges.
+    let s = setup_shortfall(80_000, 0);
+    s.vault.deposit(&s.u1, &40_000);
+    s.vault.deposit(&s.u2, &40_000);
+    let u1_before = token_balance(&s, &s.u1);
+    let u2_before = token_balance(&s, &s.u2);
+
+    advance(&s, SECS_PER_YEAR);
+    assert_eq!(
+        s.vault.execute_prize_draw(),
+        DrawResult::Skipped,
+        "unreachable yield must skip the cycle, not revert"
+    );
+
+    // Exactly one vault event: the skip (not a prize award). Capture BEFORE
+    // any further client reads, which reset env.events().all().
+    let all_events = s.env.events().all();
+    let n_total = all_events.events().len();
+    let n_vault = all_events.filter_by_contract(&s.vault_id).events().len();
+    assert!(
+        n_vault == 1,
+        "expected exactly one vault event for a skipped cycle, got total={n_total} vault={n_vault}"
+    );
+
+    // Nobody got paid.
+    assert_eq!(token_balance(&s, &s.u1), u1_before);
+    assert_eq!(token_balance(&s, &s.u2), u2_before);
+    // The cycle advanced: an immediate re-draw is TooEarly again.
+    assert_eq!(
+        s.vault.try_execute_prize_draw().unwrap_err(),
+        Ok(AquaError::TooEarly)
+    );
+    assert_eq!(s.vault.get_vault_stats().total_deposits, 80_000);
 }

@@ -1,6 +1,7 @@
 import { useState } from "react";
 import { decodeDrawResult, executePrizeDraw } from "../lib/contract";
 import { recordDraw } from "../lib/history";
+import { useToast } from "./Toast";
 
 interface Props {
   publicKey: string | null;
@@ -19,10 +20,13 @@ export default function AdminPanel({
   const [msg, setMsg] = useState<{ kind: "ok" | "err"; text: string } | null>(
     null,
   );
+  const toast = useToast();
 
   async function handleDraw() {
     if (!publicKey) {
-      setMsg({ kind: "err", text: "Connect a wallet first" });
+      const message = "Connect a wallet first";
+      setMsg({ kind: "err", text: message });
+      toast.push({ op: "draw", state: "failed", message });
       return;
     }
     setBusy(true);
@@ -55,7 +59,9 @@ export default function AdminPanel({
       }
       onDrawComplete();
     } catch (err: any) {
-      setMsg({ kind: "err", text: err?.message || "Draw failed" });
+      const message = err?.message || "Draw failed";
+      setMsg({ kind: "err", text: message });
+      toast.push({ op: "draw", state: "failed", message });
     } finally {
       setBusy(false);
     }

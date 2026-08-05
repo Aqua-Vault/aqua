@@ -1,105 +1,100 @@
-//! Blend adapter: a thin, swappable integration layer between the Aqua vault
-//! and its yield-generating pool.
+//! Yield-source adapters for the Aqua vault.
 //!
-//! On testnet this targets a [`MockYieldPool`] signalled through
-//! [`MockYieldPoolClient`], which accrues a deterministic interest rate so that
-//! draws and zero-loss invariants are demonstrable. To wire up the real Blend
-//! lending protocol, keep the same methods and point the session at a deployed
-//! Blend pool — the vault logic never changes.
+//! Each adapter implements [`YieldSource`] to drive one concrete pool protocol
+//! through the shared [`YieldPoolClient`] (see `yield_trait.rs`). The vault
+//! dispatches on its stored [`YieldSourceKind`] and never names a protocol.
 //!
 //! The shared interface models the subset of the Blend pool/backend surface
 //! Aqua depends on:
-//!   * `deposit`  -> Blend `Pool::submit`
-//!   * `withdraw` -> Blend `Pool::redeem`
-//!   * `balance`  -> Blend `Pool::get_withdrawable` + borrow value
+//!   * `deposit`      -> Blend `Pool::submit`       (tokens already pushed)
+//!   * `withdraw`     -> Blend `Pool::redeem`
+//!   * `balance`      -> Blend `Pool::get_withdrawable` − borrow value
+//!   * `withdrawable` -> Blend `Pool::get_withdrawable`
+//!   * `rate`         -> n/a: a Blend pool has per-reserve rates, not a single
+//!                       annual rate (returns 0 so the UI degrades gracefully)
 //!
-//! ## Yield-source mapping
-//!
-//! The vault never hard-codes a pool; `storage::YieldPool` points at whichever
-//! contract implements this interface:
-//!
-//! | Aqua role | `mock_pool` (testnet) | Blend (mainnet) |
-//! | --- | --- | --- |
-//! | supply principal | `deposit` (records, accrues) | `Pool::submit` |
-//! | redeem principal/yield | `withdraw` (transfers out) | `Pool::redeem` |
-//! | value of vault's position | `balance` (token balance) | withdrawable + borrow value |
-//!
-//! `MockYieldPool` exposes the extra configuration calls the mock needs
-//! (`initialize`, `set_rate`) that do not exist on Blend.
+//! On testnet the [`MockYieldSource`] drives the deterministic mock pool, which
+//! accrues simple interest so draws and zero-loss invariants are demonstrable.
 
-use soroban_sdk::{contractclient, token, Address, Env};
+use soroban_sdk::Address;
+use soroban_sdk::Env;
 
-/// The token-interface-compatible interface used to talk to a yield pool.
-///
-/// Three "roles" are collapsed into one shared interface on purpose so that a
-/// real Blend pool and the testnet mock have byte-for-byte identical call sites.
-#[contractclient(crate_path = "soroban_sdk", name = "YieldPoolClient")]
-#[allow(dead_code)]
-pub trait YieldPool {
-    /// Record `amount` of `asset` as freshly supplied principal. The vault
-    /// pushes the tokens to the pool *before* calling this (see
-    /// [`clients::pool_deposit`]), so the pool never has to pull from the
-    /// vault — that keeps sub-invocation authorization clean on-chain.
-    /// Returns the number of shares credited.
-    fn deposit(env: Env, asset: Address, amount: i128) -> i128;
+use crate::yield_trait::{YieldPoolClient, YieldSource};
 
-    /// Redeem principal from the pool and deliver it *to* `to`.
-    fn withdraw(env: Env, asset: Address, to: Address, amount: i128) -> i128;
+/// Blend adapter: drives a deployed Blend pool through `YieldPoolClient`.
+pub struct BlendYieldSource;
 
-    /// Total withdrawable value (plus accrued interest) for `owner` in the
-    /// pool, denominated in `asset`.
-    fn balance(env: Env, asset: Address, owner: Address) -> i128;
-}
-
-/// The testnet mock pool's own contract-facing interface. Used by the mock
-/// contract deployed in unit tests and the deploy scripts.
-#[contractclient(crate_path = "soroban_sdk", name = "MockYieldPoolClient")]
-#[allow(dead_code)]
-pub trait MockYieldPool {
-    /// Configure the pool after deployment: the accepted `token` (whose admin
-    /// must be this pool so it can mint interest) and `admin`.
-    fn initialize(env: Env, token: Address, admin: Address);
-
-    /// Set the gross annual interest rate in basis points (10_000 = 100%/yr).
-    fn set_rate(env: Env, bps: u64);
-
-    /// Record `amount` of `asset` as freshly supplied principal (same role as
-    /// [`YieldPool::deposit`]).
-    fn deposit(env: Env, asset: Address, amount: i128) -> i128;
-
-    /// Redeem principal and deliver it *to* `to` (same role as
-    /// [`YieldPool::withdraw`]).
-    fn withdraw(env: Env, asset: Address, to: Address, amount: i128) -> i128;
-
-    /// Current withdrawable value for `owner` in `asset` (same role as
-    /// [`YieldPool::balance`]).
-    fn balance(env: Env, asset: Address, owner: Address) -> i128;
-}
-
-/// Convenience wrappers so `lib.rs` never has to import two client types.
-pub mod clients {
-    use super::*;
-
-    pub fn pool_balance(env: &Env, pool: &Address, asset: &Address, who: &Address) -> i128 {
-        YieldPoolClient::new(env, pool).balance(asset, who)
-    }
-
-    /// Supply `amount` of principal into the pool on behalf of `vault`. The
-    /// vault pushes the tokens itself (direct token caller → invoker auth is
-    /// automatic) and the pool merely records them, so no cross-contract auth
-    /// escalation is required.
-    pub fn pool_deposit(env: &Env, pool: &Address, asset: &Address, vault: &Address, amount: i128) -> i128 {
-        token::Client::new(env, asset).transfer(vault, pool, &amount);
+impl YieldSource for BlendYieldSource {
+    fn deposit(&self, env: &Env, pool: &Address, asset: &Address, amount: i128) -> i128 {
         YieldPoolClient::new(env, pool).deposit(asset, &amount)
     }
 
-    pub fn pool_withdraw(env: &Env, pool: &Address, asset: &Address, to: &Address, amount: i128) -> i128 {
+    fn withdraw(
+        &self,
+        env: &Env,
+        pool: &Address,
+        asset: &Address,
+        to: &Address,
+        amount: i128,
+    ) -> i128 {
         YieldPoolClient::new(env, pool).withdraw(asset, to, &amount)
     }
 
-    /// Sanity check helper: read a token balance.
-    #[allow(dead_code)]
-    pub fn token_balance(env: &Env, asset: &Address, who: &Address) -> i128 {
-        token::Client::new(env, asset).balance(who)
+    fn balance(&self, env: &Env, pool: &Address, asset: &Address, who: &Address) -> i128 {
+        YieldPoolClient::new(env, pool).balance(asset, who)
+    }
+
+    fn withdrawable(
+        &self,
+        env: &Env,
+        pool: &Address,
+        asset: &Address,
+        who: &Address,
+    ) -> i128 {
+        YieldPoolClient::new(env, pool).withdrawable(asset, who)
+    }
+
+    fn rate(&self, _env: &Env, _pool: &Address, _asset: &Address) -> u64 {
+        // A multi-reserve Blend pool has no single annual rate; surface 0 so
+        // the frontend shows "—" instead of a fabricated projection.
+        0
+    }
+}
+
+/// Mock adapter: drives the testnet mock pool through `YieldPoolClient`.
+pub struct MockYieldSource;
+
+impl YieldSource for MockYieldSource {
+    fn deposit(&self, env: &Env, pool: &Address, asset: &Address, amount: i128) -> i128 {
+        YieldPoolClient::new(env, pool).deposit(asset, &amount)
+    }
+
+    fn withdraw(
+        &self,
+        env: &Env,
+        pool: &Address,
+        asset: &Address,
+        to: &Address,
+        amount: i128,
+    ) -> i128 {
+        YieldPoolClient::new(env, pool).withdraw(asset, to, &amount)
+    }
+
+    fn balance(&self, env: &Env, pool: &Address, asset: &Address, who: &Address) -> i128 {
+        YieldPoolClient::new(env, pool).balance(asset, who)
+    }
+
+    fn withdrawable(
+        &self,
+        env: &Env,
+        pool: &Address,
+        asset: &Address,
+        who: &Address,
+    ) -> i128 {
+        YieldPoolClient::new(env, pool).withdrawable(asset, who)
+    }
+
+    fn rate(&self, env: &Env, pool: &Address, asset: &Address) -> u64 {
+        YieldPoolClient::new(env, pool).rate(asset)
     }
 }

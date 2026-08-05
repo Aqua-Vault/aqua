@@ -112,6 +112,22 @@ impl MockPool {
             .get(&Key::RateBps)
             .ok_or(PoolError::NotInitialized)
     }
+
+    /// Non-fallible rate accessor mirroring [`Self::rate`]; returns 0 before
+    /// initialization. Used by the vault's yield-source adapter to populate
+    /// `annual_rate_bps` in `get_vault_stats`.
+    pub fn get_rate(e: Env) -> u64 {
+        e.storage().instance().get(&Key::RateBps).unwrap_or(0)
+    }
+
+    /// Maximum currently withdrawable value: the pool's live token balance
+    /// after accruing. A real Blend pool may report less than `balance` under
+    /// a borrow shortfall; this mock is always fully withdrawable.
+    pub fn withdrawable(e: Env, asset: Address) -> Result<i128, PoolError> {
+        let token = require_asset(&e, &asset)?;
+        accrue(&e);
+        Ok(token::Client::new(&e, &token).balance(&e.current_contract_address()))
+    }
 }
 
 fn require_asset(e: &Env, asset: &Address) -> Result<Address, PoolError> {

@@ -1,6 +1,7 @@
 import { VaultStats } from "../lib/contract";
 import { formatUsd, winProbability } from "../lib/format";
 import { computePoolShare } from "../lib/probability";
+import { useYieldPreview } from "../hooks/useYieldPreview";
 
 interface Props {
   publicKey: string | null;
@@ -13,6 +14,12 @@ export default function DepositCard({ publicKey, userBalance, stats }: Props) {
   const prob = winProbability(userBalance, tvl);
   const share = computePoolShare(userBalance, tvl) * 100;
   const hasDeposit = userBalance > BigInt(0);
+  const preview = useYieldPreview(stats);
+  const showPreview =
+    !preview.loading &&
+    stats !== null &&
+    stats.annualRateBps > 0 &&
+    preview.projectedNextPrize > BigInt(0);
 
   return (
     <div className="card">
@@ -43,6 +50,27 @@ export default function DepositCard({ publicKey, userBalance, stats }: Props) {
               </div>
             </div>
           </div>
+
+          {showPreview && (
+            <div className="rounded-xl border border-emerald-500/20 bg-emerald-500/5 p-4">
+              <div className="flex items-center justify-between">
+                <div className="stat-label">Projected Next Prize</div>
+                <div className="stat-label">APY</div>
+              </div>
+              <div className="mt-1 flex items-center justify-between">
+                <div className="text-xl font-bold text-emerald-300">
+                  ≈ {formatUsd(preview.projectedNextPrize)}
+                </div>
+                <div className="text-lg font-bold text-white">
+                  {preview.apyPct}%
+                </div>
+              </div>
+              <p className="mt-1 text-xs text-slate-500">
+                Estimate from the pool&apos;s simple-interest rate over the
+                remaining draw interval.
+              </p>
+            </div>
+          )}
 
           {hasDeposit && (
             <div className="rounded-xl border border-aqua-500/20 bg-aqua-500/5 p-3">

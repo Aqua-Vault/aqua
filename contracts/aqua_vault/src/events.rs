@@ -92,3 +92,14 @@ pub(crate) fn draw_skipped(e: &Env, total_deposits: i128, reason: &str) {
         total_deposits,
     );
 }
+
+/// Emitted when a draw cycle completes without awarding a prize because the
+/// yield pool had no reachable yield (borrow shortfall / paused pool). The
+/// cycle still advances so the draw is never wedged.
+#[allow(deprecated)]
+pub(crate) fn prize_skipped(e: &Env, winner: &Address, roll: u64) {
+    e.events().publish(
+        (Symbol::new(e, "aqua_prize_skipped"), winner.clone()),
+        roll,
+    );
+}

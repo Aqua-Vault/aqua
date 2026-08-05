@@ -25,6 +25,7 @@
 
 use soroban_sdk::{contracttype, unwrap::UnwrapOptimized, Address, Env, Vec};
 
+use crate::yield_trait::YieldSourceKind;
 use crate::AquaError;
 
 /// TTL policy for persistent (per-user / registry) entries.
@@ -48,6 +49,8 @@ pub enum DataKey {
     Asset,
     /// The yield pool contract Aqua accrues interest in.
     YieldPool,
+    /// Which yield-source implementation is wired up (`Mock` / `Blend`).
+    YieldSourceKind,
     /// Seconds between prize draws.
     DrawInterval,
     /// Ledger timestamp of the most recent draw (or initialization).
@@ -111,6 +114,20 @@ pub(crate) fn yield_pool(e: &Env) -> Address {
 
 pub(crate) fn set_yield_pool(e: &Env, a: &Address) {
     e.storage().instance().set(&DataKey::YieldPool, a);
+}
+
+/// The bound yield-source adapter kind. Defaults to [`YieldSourceKind::Mock`]
+/// so vaults initialized before this key existed (or deployed against the
+/// testnet mock pool) keep working without migration.
+pub(crate) fn yield_source_kind(e: &Env) -> YieldSourceKind {
+    e.storage()
+        .instance()
+        .get(&DataKey::YieldSourceKind)
+        .unwrap_or(YieldSourceKind::Mock)
+}
+
+pub(crate) fn set_yield_source_kind(e: &Env, kind: YieldSourceKind) {
+    e.storage().instance().set(&DataKey::YieldSourceKind, &kind);
 }
 
 pub(crate) fn draw_interval(e: &Env) -> u64 {
@@ -292,6 +309,9 @@ pub struct VaultStats {
     pub current_yield: i128,
     /// Seconds remaining until the next draw is allowed.
     pub seconds_until_next_draw: u64,
+    /// Gross annual yield-pool rate in basis points (10_000 = 100%). Read from
+    /// the pool via the yield-source adapter; 0 when unknown.
+    pub annual_rate_bps: u64,
     /// Participating depositors (capped at 100 entries).
     pub participants: Vec<Address>,
     /// `true` when the emergency circuit breaker is engaged.
