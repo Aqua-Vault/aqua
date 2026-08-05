@@ -1,5 +1,6 @@
 import { VaultStats } from "../lib/contract";
 import { formatUsd, winProbability } from "../lib/format";
+import { computePoolShare } from "../lib/probability";
 
 interface Props {
   publicKey: string | null;
@@ -10,6 +11,7 @@ interface Props {
 export default function DepositCard({ publicKey, userBalance, stats }: Props) {
   const tvl = stats?.totalDeposits ?? BigInt(0);
   const prob = winProbability(userBalance, tvl);
+  const share = computePoolShare(userBalance, tvl) * 100;
   const hasDeposit = userBalance > BigInt(0);
 
   return (
@@ -37,7 +39,7 @@ export default function DepositCard({ publicKey, userBalance, stats }: Props) {
             <div className="rounded-xl bg-ink-900/60 p-4">
               <div className="stat-label">Pool Share</div>
               <div className="mt-1 text-xl font-bold text-white">
-                {hasDeposit ? `${prob}%` : "—"}
+                {hasDeposit ? `${share.toFixed(2)}%` : "—"}
               </div>
             </div>
           </div>

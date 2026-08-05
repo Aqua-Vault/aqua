@@ -107,28 +107,36 @@ impl AquaVault {
     /// every unit starts earning. A user's win probability is their share of
     /// `total_deposits`, so holding more means a greater chance at the prize
     /// while always preserving 100% of the principal.
+    ///
+    /// Follows Checks-Effects-Interactions: all internal accounting is updated
+    /// **before** any external token/pool call, so a malicious yield pool that
+    /// re-enters the vault mid-transfer observes already-consistent state and
+    /// can never double-credit an account.
     pub fn deposit(e: Env, from: Address, amount: i128) -> core::result::Result<i128, AquaError> {
         from.require_auth();
         storage::guard_initialized(&e)?;
+        if storage::is_locked(&e) {
+            return Err(AquaError::Reentrancy);
+        }
         if amount <= 0 {
             return Err(AquaError::AmountMustBePositive);
         }
+
+        // 1. internal accounting (CEI: effects before interactions)
+        let prev = storage::user_balance(&e, &from);
+        storage::set_user_balance(&e, &from, prev + amount);
+        storage::set_total_deposits(&e, storage::total_deposits(&e) + amount);
+        storage::register_depositor(&e, &from);
 
         let asset = storage::asset(&e);
         let vault = e.current_contract_address();
         let yp = storage::yield_pool(&e);
 
-        // 1. user -> vault
+        // 2. user -> vault
         token::Client::new(&e, &asset).transfer(&from, &vault, &amount);
 
-        // 2. vault -> yield pool (accrues interest from now on)
+        // 3. vault -> yield pool (accrues interest from now on)
         pool::pool_deposit(&e, &yp, &asset, &vault, amount);
-
-        // 3. internal accounting
-        let prev = storage::user_balance(&e, &from);
-        storage::set_user_balance(&e, &from, prev + amount);
-        storage::set_total_deposits(&e, storage::total_deposits(&e) + amount);
-        storage::register_depositor(&e, &from);
 
         events::deposited(&e, &from, amount, prev + amount);
         Ok(prev + amount)
@@ -136,9 +144,16 @@ impl AquaVault {
 
     /// Withdraw up to `amount` of principal. Guarantees the user can always get
     /// back their full deposit (zero-loss) regardless of prize history.
+    ///
+    /// Also follows Checks-Effects-Interactions: the principal is deducted
+    /// from internal accounting before the pool/token transfer, so re-entrant
+    /// withdrawals observe up-to-date balances and cannot be double-credited.
     pub fn withdraw(e: Env, from: Address, amount: i128) -> core::result::Result<i128, AquaError> {
         from.require_auth();
         storage::guard_initialized(&e)?;
+        if storage::is_locked(&e) {
+            return Err(AquaError::Reentrancy);
+        }
         if amount <= 0 {
             return Err(AquaError::AmountMustBePositive);
         }
@@ -148,20 +163,20 @@ impl AquaVault {
             return Err(AquaError::InsufficientBalance);
         }
 
+        // 1. internal accounting (CEI: effects before interactions)
+        storage::set_user_balance(&e, &from, balance - amount);
+        storage::set_total_deposits(&e, storage::total_deposits(&e) - amount);
+        storage::unregister_depositor(&e, &from);
+
         let asset = storage::asset(&e);
         let vault = e.current_contract_address();
         let yp = storage::yield_pool(&e);
 
-        // 1. pull principal back out of the pool into the vault
+        // 2. pull principal back out of the pool into the vault
         pool::pool_withdraw(&e, &yp, &asset, &vault, amount);
 
-        // 2. vault -> user
+        // 3. vault -> user
         token::Client::new(&e, &asset).transfer(&vault, &from, &amount);
-
-        // 3. internal accounting
-        storage::set_user_balance(&e, &from, balance - amount);
-        storage::set_total_deposits(&e, storage::total_deposits(&e) - amount);
-        storage::unregister_depositor(&e, &from);
 
         events::withdrawn(&e, &from, amount, balance - amount);
         Ok(balance - amount)
@@ -174,8 +189,16 @@ impl AquaVault {
     ///
     /// Any caller may trigger a draw once `draw_interval` seconds have elapsed
     /// since `last_draw_time`; the admin may force one at any time.
+    ///
+    /// The multi-step prize path (pool redeem → winner transfer) is guarded by
+    /// a re-entrancy `Locked` flag: a malicious pool that calls back into the
+    /// vault mid-draw hits the [`AquaError::Reentrancy`] guard instead of
+    /// reading half-updated state or running a second draw.
     pub fn execute_prize_draw(e: Env) -> core::result::Result<DrawOutcome, AquaError> {
         storage::guard_initialized(&e)?;
+        if storage::is_locked(&e) {
+            return Err(AquaError::Reentrancy);
+        }
 
         if !storage::can_draw(&e) {
             return Err(AquaError::TooEarly);
@@ -197,10 +220,18 @@ impl AquaVault {
             return Err(AquaError::NoYieldToAward);
         }
 
+        // Lock the vault while the draw's external interactions are in flight.
+        // A re-entrant call during `pool_withdraw`/`transfer` must not be able
+        // to mutate state that this draw already depends on.
+        storage::set_locked(&e, true);
+
         // Draw the weighted winner via the CAP-0074 on-chain PRNG.
         let outcome = select_weighted_winner(&e);
         pool::pool_withdraw(&e, &yp, &asset, &vault, yield_amount);
         token::Client::new(&e, &asset).transfer(&vault, &outcome.winner, &yield_amount);
+
+        // Release the guard before returning.
+        storage::set_locked(&e, false);
 
         storage::set_last_draw_time(&e, e.ledger().timestamp());
         events::prize_awarded(&e, &outcome.winner, yield_amount, outcome.roll);

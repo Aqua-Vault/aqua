@@ -4,8 +4,9 @@ import { useWallet } from "../hooks/useWallet";
 import { useVault } from "../hooks/useVault";
 import { DrawRecord, loadDraws } from "../lib/history";
 import { IS_CONFIGURED, VAULT_ID, explorerContractUrl } from "../lib/config";
-import { shortenAddress } from "../lib/format";
+import { shortenAddress, toStroops } from "../lib/format";
 import { getAdmin } from "../lib/contract";
+import { resetLedgerTimeCache } from "../lib/ledger";
 
 import WalletButton from "../components/WalletButton";
 import StatsBar from "../components/StatsBar";
@@ -13,25 +14,44 @@ import DepositCard from "../components/DepositCard";
 import ActionPanel from "../components/ActionPanel";
 import AdminPanel from "../components/AdminPanel";
 import LiveDrawFeed from "../components/LiveDrawFeed";
+import ProbabilityCalculator from "../components/ProbabilityCalculator";
 
 export default function Home() {
   const wallet = useWallet();
   const vault = useVault(wallet.publicKey);
-  const [anchorMs, setAnchorMs] = useState(Date.now());
+  const [depositAmount, setDepositAmount] = useState("");
   const [draws, setDraws] = useState<DrawRecord[]>([]);
   const [admin, setAdmin] = useState<string | null>(null);
   const [connectErr, setConnectErr] = useState<string | null>(null);
-
-  // Re-anchor the countdown whenever fresh stats arrive.
-  useEffect(() => {
-    if (vault.stats) setAnchorMs(Date.now());
-  }, [vault.stats?.secondsUntilNextDraw]);
 
   useEffect(() => setDraws(loadDraws()), []);
 
   useEffect(() => {
     if (IS_CONFIGURED) getAdmin().then(setAdmin).catch(() => setAdmin(null));
   }, []);
+
+  // Mid-session account switch in Freighter: refresh vault state and re-anchor
+  // the ledger clock so the new account's numbers render immediately.
+  useEffect(() => {
+    if (wallet.accountChanged) {
+      resetLedgerTimeCache();
+      vault.refresh();
+      wallet.acknowledgeAccountChange();
+    }
+  }, [wallet.accountChanged, wallet, vault]);
+
+  // Ledger close time captured alongside stats on the same poll, so the
+  // countdown stays anchored to chain time. Fallback: null → wall-clock.
+  const ledgerCloseMs = vault.stats?.ledgerCloseMs ?? null;
+
+  // Live preview deposit for the probability calculator (raw stroops).
+  const projectedDeposit = useMemo(() => {
+    try {
+      return toStroops(depositAmount);
+    } catch {
+      return BigInt(0);
+    }
+  }, [depositAmount]);
 
   const canDraw = (vault.stats?.secondsUntilNextDraw ?? 1) <= 0;
   const isAdmin = useMemo(
@@ -129,7 +149,7 @@ export default function Home() {
         <section className="mt-8">
           <StatsBar
             stats={vault.stats}
-            anchorMs={anchorMs}
+            ledgerCloseMs={ledgerCloseMs}
             loading={vault.loading}
           />
         </section>
@@ -150,8 +170,15 @@ export default function Home() {
               publicKey={wallet.publicKey}
               userBalance={vault.userBalance}
               usdcBalance={vault.usdcBalance}
+              amount={depositAmount}
+              onAmountChange={setDepositAmount}
               onConnect={handleConnect}
               onDone={afterAction}
+            />
+            <ProbabilityCalculator
+              userBalance={vault.userBalance}
+              totalDeposits={vault.stats?.totalDeposits ?? BigInt(0)}
+              projectedDeposit={projectedDeposit}
             />
             <AdminPanel
               publicKey={wallet.publicKey}

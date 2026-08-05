@@ -46,6 +46,9 @@ pub enum DataKey {
     UserBalance(Address),
     /// Ordered list of users with positive principal (draw weight sources).
     Depositors,
+    /// Re-entrancy guard: `true` while a multi-step external interaction
+    /// (prize draw) is in progress.
+    Locked,
 }
 
 pub(crate) fn guard_initialized(e: &Env) -> core::result::Result<(), AquaError> {
@@ -107,6 +110,22 @@ pub(crate) fn total_deposits(e: &Env) -> i128 {
 
 pub(crate) fn set_total_deposits(e: &Env, v: i128) {
     e.storage().instance().set(&DataKey::TotalDeposits, &v);
+}
+
+// ---- Re-entrancy guard -------------------------------------------------------
+
+/// Whether a multi-step external interaction is currently in progress. While
+/// `true`, every mutating vault entry point reverts with
+/// [`AquaError::Reentrancy`] instead of reading potentially half-updated state.
+pub(crate) fn is_locked(e: &Env) -> bool {
+    e.storage()
+        .instance()
+        .get(&DataKey::Locked)
+        .unwrap_or(false)
+}
+
+pub(crate) fn set_locked(e: &Env, locked: bool) {
+    e.storage().instance().set(&DataKey::Locked, &locked);
 }
 
 // ---- Per-user principal -----------------------------------------------------
