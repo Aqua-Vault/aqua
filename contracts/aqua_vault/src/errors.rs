@@ -1,3 +1,21 @@
+//! # Error codes
+//!
+//! [`AquaError`] is the single failure channel for the vault. It is exported to
+//! callers through the WASM ABI via `#[contracterror]`, so clients see the exact
+//! variant (rather than a generic failure) through the `try_` client methods.
+//!
+//! | Code | Variant | Fires when |
+//! | --- | --- | --- |
+//! | 1 | `AlreadyInitialized` | `initialize` called more than once |
+//! | 2 | `NotInitialized` | any mutating/ledger call before `initialize` |
+//! | 3 | `AmountMustBePositive` | deposit/withdraw amount is zero or negative |
+//! | 4 | `InsufficientBalance` | withdraw exceeds the caller's principal |
+//! | 5 | `TooEarly` | a draw is attempted before the interval elapses |
+//! | 6 | `NoDepositors` | no user holds positive principal |
+//! | 7 | `NoYieldToAward` | current yield is not positive |
+//! | 8 | `InvalidConfig` | `draw_interval` is configured as zero |
+//! | 9 | `Unauthorized` | a non-admin calls an admin-only action |
+
 use soroban_sdk::contracterror;
 
 /// Error codes surfaced to callers as `Err(AquaError::…)`.

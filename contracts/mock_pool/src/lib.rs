@@ -24,20 +24,29 @@ use soroban_sdk::{
 
 const SECS_PER_YEAR: u64 = 31_536_000;
 
+/// Failure channel for the mock pool.
 #[contracterror]
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 #[repr(u32)]
 pub enum PoolError {
+    /// `initialize` was called more than once.
     AlreadyInitialized = 1,
+    /// A call was made before `initialize`.
     NotInitialized = 2,
+    /// A call referenced an asset other than the configured token.
     WrongAsset = 3,
 }
 
+/// Storage keys. All are instance-level singletons (single copy, hot reads).
 #[contracttype]
 pub enum Key {
+    /// The accepted asset (whose admin this pool must be).
     Token,
+    /// The address authorized to change the rate.
     Admin,
+    /// Ledger timestamp of the last accrual.
     LastTs,
+    /// Gross annual interest rate in basis points.
     RateBps,
 }
 

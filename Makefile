@@ -5,7 +5,7 @@
 NETWORK          ?= testnet
 ADMIN_IDENTITY   ?= aqua_admin
 
-.PHONY: all help setup build test test-vault test-pool deploy initialize clean \
+.PHONY: all help setup build test test-vault test-pool wasm-size docs deploy initialize clean \
         install-deps frontend-install frontend-dev frontend-build
 
 all: build test deploy
@@ -44,6 +44,12 @@ test-vault: ## Run only vault contract tests
 
 test-pool: ## Run only mock pool tests
 	@cargo test -p mock_pool --features testutils
+
+wasm-size: ## Measure & guardrail optimized WASM sizes
+	@bash scripts/analyze_wasm.sh
+
+docs: ## Build crate documentation (cargo doc)
+	@cargo doc --no-deps
 
 deploy: build ## Deploy + initialize all contracts on Stellar Testnet
 	@bash scripts/02_deploy.sh $(ADMIN_IDENTITY) $(NETWORK)

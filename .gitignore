@@ -4,6 +4,7 @@
 /target/
 **/*.rs.bk
 *.wasm
+test_snapshots/
 
 # ==============================================================================
 # Node / Next.js (frontend has its own .gitignore too)
@@ -14,6 +15,8 @@ frontend/out/
 frontend/build/
 *.tsbuildinfo
 frontend/next-env.d.ts
+frontend/test-results/
+frontend/playwright-report/
 
 # ==============================================================================
 # Environment & secrets

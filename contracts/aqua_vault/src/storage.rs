@@ -1,3 +1,28 @@
+//! # Storage layout
+//!
+//! All vault state is addressed through the [`DataKey`] enum. Soroban splits
+//! storage into two tiers, and Aqua uses them as follows:
+//!
+//! * **Instance storage** (single copy, cheap for hot reads) — the singleton
+//!   configuration and aggregate accounting: [`DataKey::Admin`],
+//!   [`DataKey::Asset`], [`DataKey::YieldPool`], [`DataKey::DrawInterval`],
+//!   [`DataKey::LastDrawTime`], [`DataKey::TotalDeposits`].
+//! * **Persistent storage** (keyed, survives until deleted) — anything
+//!   address- or list-shaped and potentially large: one entry per user
+//!   ([`DataKey::UserBalance`]) and the ordered depositor registry
+//!   ([`DataKey::Depositors`]).
+//!
+//! Rationale: instance reads are cheaper and there is exactly one admin/asset/
+//! pool, while user balances and the depositor list scale with adoption and
+//! belong in persistent storage where they can be expired/released.
+//!
+//! ## Depositor registry
+//!
+//! [`register_depositor`] / [`unregister_depositor`] keep `Depositors` exactly
+//! in sync with positive principal so the winner-selection routine can sum
+//! weights over a list of known-participating addresses instead of scanning
+//! arbitrary keyspace.
+
 use soroban_sdk::{contracttype, unwrap::UnwrapOptimized, Address, Env, Vec};
 
 use crate::AquaError;
@@ -5,13 +30,21 @@ use crate::AquaError;
 /// Storage keys for instance (singleton) fields.
 #[contracttype]
 pub enum DataKey {
+    /// The authorized manager (can force early draws).
     Admin,
+    /// The deposit token contract (testnet USDC / Stellar Asset Contract).
     Asset,
+    /// The yield pool contract Aqua accrues interest in.
     YieldPool,
+    /// Seconds between prize draws.
     DrawInterval,
+    /// Ledger timestamp of the most recent draw (or initialization).
     LastDrawTime,
+    /// Sum of all user principals; doubles as the draw weight total.
     TotalDeposits,
+    /// A single user's principal balance.
     UserBalance(Address),
+    /// Ordered list of users with positive principal (draw weight sources).
     Depositors,
 }
 
@@ -146,8 +179,12 @@ pub(crate) fn can_draw(e: &Env) -> bool {
 #[contracttype]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VaultStats {
+    /// Sum of all user principals locked in the vault.
     pub total_deposits: i128,
+    /// Live yield: current pool value minus total principal, floored at zero.
     pub current_yield: i128,
+    /// Seconds remaining until the next draw is allowed.
     pub seconds_until_next_draw: u64,
+    /// Participating depositors (capped at 100 entries).
     pub participants: Vec<Address>,
 }

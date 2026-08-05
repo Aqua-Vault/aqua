@@ -28,6 +28,56 @@ jobs:
       - name: Run contract tests
         run: cargo test --workspace --features testutils
 
+  contract-wasm-size:
+    name: WASM size guardrail
+    runs-on: ubuntu-latest
+    needs: [contracts]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32v1-none
+
+      - name: Install Stellar CLI
+        uses: stellar/stellar-cli@v27.0.0
+
+      - name: Install wasm-tools
+        run: cargo install wasm-tools --locked
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Fetch base branch
+        if: github.event_name == 'pull_request'
+        run: git fetch --no-tags origin "$GITHUB_BASE_REF"
+
+      - name: Build base-branch baseline (PR only)
+        if: github.event_name == 'pull_request'
+        run: |
+          BASE_SHA=$(git merge-base HEAD "origin/$GITHUB_BASE_REF")
+          git worktree add /tmp/aqua-base "$BASE_SHA"
+          cd /tmp/aqua-base
+          stellar contract build --package aqua_vault
+          stellar contract build --package mock_pool
+
+      - name: Run WASM size analysis
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            bash scripts/analyze_wasm.sh --baseline /tmp/aqua-base/target
+          else
+            bash scripts/analyze_wasm.sh
+          fi
+
   frontend:
     name: Frontend (type-check + build)
     runs-on: ubuntu-latest
