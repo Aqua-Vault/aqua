@@ -27,6 +27,18 @@ use soroban_sdk::{contracttype, unwrap::UnwrapOptimized, Address, Env, Vec};
 
 use crate::AquaError;
 
+/// TTL policy for persistent (per-user / registry) entries.
+///
+/// Instance storage is automatically TTL-extended by the ledger on every
+/// invocation that touches the contract, so singleton config fields are exempt
+/// from this policy. Persistent entries are NOT auto-extended: they die unless
+/// the contract explicitly calls `extend_ttl`. Because Aqua is a savings
+/// product (users stay idle for months between deposits), every persistent
+/// read/write below refreshes the entry out to ~1 year when it is at or below
+/// the network minimum TTL, so a recorded principal can never silently expire.
+pub(crate) const PERSISTENT_TTL_EXTEND_THRESHOLD: u32 = 4096;
+pub(crate) const PERSISTENT_TTL_EXTEND_TO: u32 = 6_312_000;
+
 /// Storage keys for instance (singleton) fields.
 #[contracttype]
 pub enum DataKey {
@@ -49,6 +61,10 @@ pub enum DataKey {
     /// Re-entrancy guard: `true` while a multi-step external interaction
     /// (prize draw) is in progress.
     Locked,
+    /// Emergency circuit breaker flag (`true` = deposits/draws blocked).
+    Paused,
+    /// Per-user standing-balance cap in `asset` units (`0` = unlimited).
+    MaxDepositPerInterval,
 }
 
 pub(crate) fn guard_initialized(e: &Env) -> core::result::Result<(), AquaError> {
@@ -65,7 +81,10 @@ pub(crate) fn has_admin(e: &Env) -> bool {
 }
 
 pub(crate) fn admin(e: &Env) -> Address {
-    e.storage().instance().get(&DataKey::Admin).unwrap_optimized()
+    e.storage()
+        .instance()
+        .get(&DataKey::Admin)
+        .unwrap_optimized()
 }
 
 pub(crate) fn set_admin(e: &Env, a: &Address) {
@@ -73,7 +92,10 @@ pub(crate) fn set_admin(e: &Env, a: &Address) {
 }
 
 pub(crate) fn asset(e: &Env) -> Address {
-    e.storage().instance().get(&DataKey::Asset).unwrap_optimized()
+    e.storage()
+        .instance()
+        .get(&DataKey::Asset)
+        .unwrap_optimized()
 }
 
 pub(crate) fn set_asset(e: &Env, a: &Address) {
@@ -81,7 +103,10 @@ pub(crate) fn set_asset(e: &Env, a: &Address) {
 }
 
 pub(crate) fn yield_pool(e: &Env) -> Address {
-    e.storage().instance().get(&DataKey::YieldPool).unwrap_optimized()
+    e.storage()
+        .instance()
+        .get(&DataKey::YieldPool)
+        .unwrap_optimized()
 }
 
 pub(crate) fn set_yield_pool(e: &Env, a: &Address) {
@@ -89,7 +114,10 @@ pub(crate) fn set_yield_pool(e: &Env, a: &Address) {
 }
 
 pub(crate) fn draw_interval(e: &Env) -> u64 {
-    e.storage().instance().get(&DataKey::DrawInterval).unwrap_optimized()
+    e.storage()
+        .instance()
+        .get(&DataKey::DrawInterval)
+        .unwrap_optimized()
 }
 
 pub(crate) fn set_draw_interval(e: &Env, v: u64) {
@@ -97,7 +125,10 @@ pub(crate) fn set_draw_interval(e: &Env, v: u64) {
 }
 
 pub(crate) fn last_draw_time(e: &Env) -> u64 {
-    e.storage().instance().get(&DataKey::LastDrawTime).unwrap_optimized()
+    e.storage()
+        .instance()
+        .get(&DataKey::LastDrawTime)
+        .unwrap_optimized()
 }
 
 pub(crate) fn set_last_draw_time(e: &Env, v: u64) {
@@ -105,7 +136,10 @@ pub(crate) fn set_last_draw_time(e: &Env, v: u64) {
 }
 
 pub(crate) fn total_deposits(e: &Env) -> i128 {
-    e.storage().instance().get(&DataKey::TotalDeposits).unwrap_or(0)
+    e.storage()
+        .instance()
+        .get(&DataKey::TotalDeposits)
+        .unwrap_or(0)
 }
 
 pub(crate) fn set_total_deposits(e: &Env, v: i128) {
@@ -128,32 +162,68 @@ pub(crate) fn set_locked(e: &Env, locked: bool) {
     e.storage().instance().set(&DataKey::Locked, &locked);
 }
 
+// ---- Emergency circuit breaker -------------------------------------------------
+
+/// Whether new deposits and draws are currently blocked.
+pub(crate) fn is_paused(e: &Env) -> bool {
+    e.storage()
+        .instance()
+        .get(&DataKey::Paused)
+        .unwrap_or(false)
+}
+
+pub(crate) fn set_paused(e: &Env, paused: bool) {
+    e.storage().instance().set(&DataKey::Paused, &paused);
+}
+
 // ---- Per-user principal -----------------------------------------------------
 
 pub(crate) fn user_balance(e: &Env, who: &Address) -> i128 {
-    e.storage()
-        .persistent()
-        .get(&DataKey::UserBalance(who.clone()))
-        .unwrap_or(0)
+    let key = DataKey::UserBalance(who.clone());
+    let val: Option<i128> = e.storage().persistent().get(&key);
+    if val.is_some() {
+        e.storage().persistent().extend_ttl(
+            &key,
+            PERSISTENT_TTL_EXTEND_THRESHOLD,
+            PERSISTENT_TTL_EXTEND_TO,
+        );
+    }
+    val.unwrap_or(0)
 }
 
 pub(crate) fn set_user_balance(e: &Env, who: &Address, v: i128) {
-    e.storage()
-        .persistent()
-        .set(&DataKey::UserBalance(who.clone()), &v);
+    let key = DataKey::UserBalance(who.clone());
+    e.storage().persistent().set(&key, &v);
+    e.storage().persistent().extend_ttl(
+        &key,
+        PERSISTENT_TTL_EXTEND_THRESHOLD,
+        PERSISTENT_TTL_EXTEND_TO,
+    );
 }
 
 // ---- Depositors membership (weight source for draws) ------------------------
 
 pub(crate) fn depositors(e: &Env) -> Vec<Address> {
-    e.storage()
-        .persistent()
-        .get(&DataKey::Depositors)
-        .unwrap_or_else(|| Vec::new(e))
+    let key = DataKey::Depositors;
+    let val: Option<Vec<Address>> = e.storage().persistent().get(&key);
+    if val.is_some() {
+        e.storage().persistent().extend_ttl(
+            &key,
+            PERSISTENT_TTL_EXTEND_THRESHOLD,
+            PERSISTENT_TTL_EXTEND_TO,
+        );
+    }
+    val.unwrap_or_else(|| Vec::new(e))
 }
 
 pub(crate) fn set_depositors(e: &Env, list: &Vec<Address>) {
-    e.storage().persistent().set(&DataKey::Depositors, list);
+    let key = DataKey::Depositors;
+    e.storage().persistent().set(&key, list);
+    e.storage().persistent().extend_ttl(
+        &key,
+        PERSISTENT_TTL_EXTEND_THRESHOLD,
+        PERSISTENT_TTL_EXTEND_TO,
+    );
 }
 
 /// Append `who` if they are not already tracked and hold a positive balance.
@@ -184,6 +254,24 @@ pub(crate) fn unregister_depositor(e: &Env, who: &Address) {
     set_depositors(e, &pruned);
 }
 
+// ---- Anti-whale rate limiting -------------------------------------------------
+
+/// Standing-balance cap for a single user (`0` = unlimited). Semantics are
+/// deliberately simple: the cap bounds `user_balance`, not total deposits over
+/// time, and only affects new deposits — withdrawals are never limited.
+pub(crate) fn max_deposit_per_interval(e: &Env) -> i128 {
+    e.storage()
+        .instance()
+        .get(&DataKey::MaxDepositPerInterval)
+        .unwrap_or(0)
+}
+
+pub(crate) fn set_max_deposit_per_interval(e: &Env, v: i128) {
+    e.storage()
+        .instance()
+        .set(&DataKey::MaxDepositPerInterval, &v);
+}
+
 /// Whether a draw may be run right now: interval elapsed, or caller is admin
 /// (forcing an early draw). Admin check requires fresh auth at the call site;
 /// here we only read who the admin is and let `execute_prize_draw` decide.
@@ -206,4 +294,6 @@ pub struct VaultStats {
     pub seconds_until_next_draw: u64,
     /// Participating depositors (capped at 100 entries).
     pub participants: Vec<Address>,
+    /// `true` when the emergency circuit breaker is engaged.
+    pub paused: bool,
 }

@@ -8,6 +8,7 @@ interface Props {
   usdcBalance: bigint;
   amount: string;
   onAmountChange: (value: string) => void;
+  paused: boolean;
   onConnect: () => void;
   onDone: () => void;
 }
@@ -20,6 +21,7 @@ export default function ActionPanel({
   usdcBalance,
   amount,
   onAmountChange,
+  paused,
   onConnect,
   onDone,
 }: Props) {
@@ -30,6 +32,7 @@ export default function ActionPanel({
   );
 
   const max = tab === "deposit" ? usdcBalance : userBalance;
+  const depositBlocked = paused && tab === "deposit";
 
   const validation = useMemo(() => {
     if (!amount) return null;
@@ -44,11 +47,15 @@ export default function ActionPanel({
     return null;
   }, [amount, max]);
 
-  const canSubmit = publicKey && amount && !validation && !busy;
+  const canSubmit = publicKey && amount && !validation && !busy && !depositBlocked;
 
   async function handleSubmit() {
     if (!publicKey) {
       onConnect();
+      return;
+    }
+    if (depositBlocked) {
+      setMsg({ kind: "err", text: "Deposits are paused — please try again later." });
       return;
     }
     if (!canSubmit) return;
@@ -119,6 +126,12 @@ export default function ActionPanel({
 
       {validation && (
         <p className="mt-2 text-sm text-rose-300">{validation}</p>
+      )}
+
+      {depositBlocked && (
+        <p className="mt-2 text-sm text-amber-300">
+          Deposits are paused by the admin. You can still withdraw.
+        </p>
       )}
 
       {/* Fee estimate — Soroban testnet base fee is a fraction of a cent. */}

@@ -18,12 +18,27 @@
 
 use soroban_sdk::{Address, Env, Symbol};
 
+/// The reason a prize draw cycle was skipped instead of awarding a prize.
+#[allow(dead_code)]
+pub(crate) const SKIP_REASON_NO_YIELD: &str = "no_yield";
+
 /// Contract-level event topics. Symbols are built at call time because
 /// `Symbol::new` requires an `Env` in SDK 27.
 #[allow(deprecated)]
-pub(crate) fn initialized(e: &Env, admin: &Address, asset: &Address, pool: &Address, interval: u64) {
+pub(crate) fn initialized(
+    e: &Env,
+    admin: &Address,
+    asset: &Address,
+    pool: &Address,
+    interval: u64,
+) {
     e.events().publish(
-        (Symbol::new(e, "aqua_initialized"), admin.clone(), asset.clone(), pool.clone()),
+        (
+            Symbol::new(e, "aqua_initialized"),
+            admin.clone(),
+            asset.clone(),
+            pool.clone(),
+        ),
         interval,
     );
 }
@@ -49,5 +64,31 @@ pub(crate) fn prize_awarded(e: &Env, winner: &Address, prize_amount: i128, roll:
     e.events().publish(
         (Symbol::new(e, "aqua_prize_awarded"), winner.clone()),
         (prize_amount, roll),
+    );
+}
+
+/// Emergency circuit breaker engaged by the admin. New deposits and draws are
+/// blocked until `aqua_unpaused` is emitted.
+#[allow(deprecated)]
+pub(crate) fn paused(e: &Env, admin: &Address) {
+    e.events()
+        .publish((Symbol::new(e, "aqua_paused"), admin.clone()), ());
+}
+
+/// Emergency circuit breaker disengaged by the admin.
+#[allow(deprecated)]
+pub(crate) fn unpaused(e: &Env, admin: &Address) {
+    e.events()
+        .publish((Symbol::new(e, "aqua_unpaused"), admin.clone()), ());
+}
+
+/// A prize-draw cycle completed without awarding a prize (e.g. no positive
+/// yield accrued this interval). The timer has been re-armed, so the next draw
+/// becomes eligible after a fresh `draw_interval`.
+#[allow(deprecated)]
+pub(crate) fn draw_skipped(e: &Env, total_deposits: i128, reason: &str) {
+    e.events().publish(
+        (Symbol::new(e, "aqua_draw_skipped"), Symbol::new(e, reason)),
+        total_deposits,
     );
 }

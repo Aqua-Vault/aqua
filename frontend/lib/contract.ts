@@ -33,6 +33,39 @@ export interface VaultStats {
   participants: string[];
   /** Close time (ms) of the ledger the stats were read at; null if unavailable. */
   ledgerCloseMs: number | null;
+  /** `true` when the emergency circuit breaker is engaged (deposits/draws blocked). */
+  paused: boolean;
+}
+
+/** The `DrawResult` enum returned by `execute_prize_draw` (union encoding). */
+export type DrawResult =
+  | { tag: "Awarded"; values: [DrawOutcome] }
+  | { tag: "Skipped"; values: [] };
+
+export interface DrawOutcome {
+  winner: string;
+  roll: bigint;
+  total_weight: bigint;
+  participants: string[];
+}
+
+/**
+ * Decode the `DrawResult` union produced by `scValToNative` on the Soroban
+ * `#[contracttype]` enum: `{ tag, values }`. `Awarded` carries the
+ * `DrawOutcome` struct as `values[0]`; `Skipped` carries nothing.
+ */
+export function decodeDrawResult(ret: unknown): DrawResult | null {
+  if (!ret || typeof ret !== "object") return null;
+  const r = ret as { tag?: string; values?: unknown[] };
+  if (r.tag === "Awarded") {
+    const outcome = (r.values?.[0] ?? null) as DrawOutcome | null;
+    if (!outcome || typeof outcome.winner !== "string") return null;
+    return { tag: "Awarded", values: [outcome] };
+  }
+  if (r.tag === "Skipped") {
+    return { tag: "Skipped", values: [] };
+  }
+  return null;
 }
 
 // ---------------------------------------------------------------------------
@@ -162,6 +195,7 @@ export async function getVaultStats(): Promise<VaultStats> {
       current_yield: bigint;
       seconds_until_next_draw: bigint;
       participants: string[];
+      paused: boolean;
     }>(VAULT_ID, "get_vault_stats", []),
     getLedgerCloseTime(),
   ]);
@@ -172,6 +206,7 @@ export async function getVaultStats(): Promise<VaultStats> {
     secondsUntilNextDraw: Number(raw.seconds_until_next_draw),
     participants: raw.participants ?? [],
     ledgerCloseMs,
+    paused: Boolean(raw.paused),
   };
 }
 

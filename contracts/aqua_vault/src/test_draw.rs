@@ -39,7 +39,7 @@ use soroban_sdk::{
 };
 
 use crate::test::{MockYieldPool, MockYieldPoolClient};
-use crate::{AquaVault, AquaVaultClient};
+use crate::{AquaVault, AquaVaultClient, DrawResult};
 
 /// Annual yield rate the mock pool accrues (100% / year). Chosen so a single
 /// 24h interval always produces integer yield > 0 for every principal size
@@ -163,7 +163,11 @@ fn test_multiuser_2000_draw_convergence_and_zero_loss() {
         h.env
             .ledger()
             .set_timestamp(h.env.ledger().timestamp() + DRAW_INTERVAL_SECS);
-        let outcome = h.vault.execute_prize_draw();
+        let result = h.vault.execute_prize_draw();
+        let winner = match result {
+            DrawResult::Awarded(outcome) => outcome.winner,
+            DrawResult::Skipped => panic!("round {round}: draw unexpectedly skipped"),
+        };
 
         // Selection used the balances as of this round; draws never move
         // principal, so the mirror is exact.
@@ -184,7 +188,7 @@ fn test_multiuser_2000_draw_convergence_and_zero_loss() {
         let winner_idx = h
             .users
             .iter()
-            .position(|u| u == outcome.winner)
+            .position(|u| u == winner)
             .expect("winner must be one of the depositors");
         observed[winner_idx] += 1;
 

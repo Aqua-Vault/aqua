@@ -52,6 +52,15 @@ export default function DepositCard({ publicKey, userBalance, stats }: Props) {
               </p>
             </div>
           )}
+
+          {stats?.paused && (
+            <div className="rounded-xl border border-amber-500/30 bg-amber-500/10 p-3">
+              <p className="text-xs text-amber-100/90">
+                <span className="font-semibold">Paused:</span> new deposits and
+                draws are temporarily halted. Withdrawals remain available.
+              </p>
+            </div>
+          )}
         </div>
       )}
     </div>

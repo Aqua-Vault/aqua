@@ -53,7 +53,8 @@ export default function Home() {
     }
   }, [depositAmount]);
 
-  const canDraw = (vault.stats?.secondsUntilNextDraw ?? 1) <= 0;
+  const canDraw =
+    (vault.stats?.secondsUntilNextDraw ?? 1) <= 0 && !vault.stats?.paused;
   const isAdmin = useMemo(
     () => Boolean(wallet.publicKey && admin && wallet.publicKey === admin),
     [wallet.publicKey, admin],
@@ -131,6 +132,18 @@ export default function Home() {
           </div>
         )}
 
+        {vault.stats?.paused && (
+          <div className="mt-4 flex items-start gap-3 rounded-xl border border-amber-500/40 bg-amber-500/10 px-4 py-3 text-sm text-amber-200">
+            <span className="text-lg leading-none">⚠️</span>
+            <div>
+              <span className="font-semibold">
+                Vault paused — deposits and draws are temporarily halted.
+              </span>{" "}
+              Your principal stays fully withdrawable.
+            </div>
+          </div>
+        )}
+
         {/* Hero copy */}
         <section className="mt-8 text-center sm:mt-10">
           <h2 className="mx-auto max-w-3xl text-3xl font-extrabold leading-tight text-white sm:text-5xl">
@@ -172,6 +185,7 @@ export default function Home() {
               usdcBalance={vault.usdcBalance}
               amount={depositAmount}
               onAmountChange={setDepositAmount}
+              paused={vault.stats?.paused ?? false}
               onConnect={handleConnect}
               onDone={afterAction}
             />
@@ -183,6 +197,7 @@ export default function Home() {
             <AdminPanel
               publicKey={wallet.publicKey}
               canDraw={canDraw}
+              paused={vault.stats?.paused ?? false}
               onDrawComplete={afterAction}
             />
           </div>
