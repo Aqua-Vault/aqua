@@ -25,8 +25,8 @@ body {
     @apply mt-1 text-2xl font-bold text-white sm:text-3xl;
   }
   .btn {
-    @apply inline-flex items-center justify-center gap-2 rounded-xl px-5 py-3 text-sm font-semibold transition
-      focus:outline-none focus:ring-2 focus:ring-aqua-400/60 disabled:cursor-not-allowed disabled:opacity-50;
+    @apply inline-flex min-h-[44px] items-center justify-center gap-2 rounded-xl px-5 py-3 text-sm font-semibold transition
+      focus:outline-none focus-visible:ring-2 focus-visible:ring-aqua-400/60 disabled:cursor-not-allowed disabled:opacity-50;
   }
   .btn-primary {
     @apply btn bg-aqua-500 text-white hover:bg-aqua-400 active:bg-aqua-600;
@@ -35,11 +35,14 @@ body {
     @apply btn border border-white/15 bg-white/5 text-slate-100 hover:bg-white/10;
   }
   .input {
-    @apply w-full rounded-xl border border-white/10 bg-ink-900/80 px-4 py-3 text-lg text-white
-      placeholder:text-slate-500 focus:border-aqua-400/60 focus:outline-none focus:ring-2 focus:ring-aqua-400/40;
+    /* 16px+ font on inputs prevents iOS Safari auto-zoom on focus. */
+    @apply w-full rounded-xl border border-white/10 bg-ink-900/80 px-4 py-3 text-base text-white
+      placeholder:text-slate-500 focus:border-aqua-400/60 focus:outline-none focus:ring-2 focus:ring-aqua-400/40 sm:text-lg;
   }
   .tab {
-    @apply flex-1 rounded-lg px-4 py-2 text-sm font-semibold transition;
+    /* py-3 keeps tap targets at ~44px on touch devices. */
+    @apply flex flex-1 min-h-[44px] items-center justify-center rounded-lg px-4 py-2.5 text-sm font-semibold transition
+      focus:outline-none focus-visible:ring-2 focus-visible:ring-aqua-400/60;
   }
   .tab-active {
     @apply bg-aqua-500 text-white;

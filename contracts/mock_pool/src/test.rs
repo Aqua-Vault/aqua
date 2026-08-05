@@ -74,6 +74,25 @@ fn set_rate_changes_yield() {
 }
 
 #[test]
+fn get_rate_returns_configured_bps() {
+    let t = setup();
+    // Default is 10% (1_000 bps) set at initialize.
+    assert_eq!(t.pool.get_rate(), 1_000);
+    t.pool.set_rate(&2_500);
+    assert_eq!(t.pool.get_rate(), 2_500);
+}
+
+#[test]
+fn withdrawable_equals_live_balance() {
+    let t = setup();
+    token::Client::new(&t.env, &t.token).transfer(&t.depositor, &t.pool_id, &100_000);
+    t.pool.deposit(&t.token, &100_000);
+    advance(&t, YEAR); // 10% default rate
+    assert_eq!(t.pool.withdrawable(&t.token), 110_000);
+    assert_eq!(t.pool.balance(&t.token, &t.pool_id), t.pool.withdrawable(&t.token));
+}
+
+#[test]
 fn rejects_wrong_asset() {
     let t = setup();
     let other = Address::generate(&t.env);

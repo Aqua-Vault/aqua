@@ -30,6 +30,8 @@ export interface VaultStats {
   totalDeposits: bigint;
   currentYield: bigint;
   secondsUntilNextDraw: number;
+  /** Gross annual yield-pool rate in basis points (10_000 = 100%). 0 = unknown. */
+  annualRateBps: number;
   participants: string[];
   /** Close time (ms) of the ledger the stats were read at; null if unavailable. */
   ledgerCloseMs: number | null;
@@ -128,60 +130,104 @@ async function firstReadSource(): Promise<string> {
   return READ_SOURCE;
 }
 
+// ---------------------------------------------------------------------------
+// Transaction lifecycle emitter (toast notifications)
+// ---------------------------------------------------------------------------
+
+export type TxOp = "deposit" | "withdraw" | "draw";
+export type TxState =
+  | "submitting"
+  | "signing"
+  | "submitted"
+  | "confirmed"
+  | "failed";
+
+export interface TxLifecycleEvent {
+  op: TxOp;
+  state: TxState;
+  txHash?: string;
+  message?: string;
+}
+
+type TxLifecycleHandler = (event: TxLifecycleEvent) => void;
+
+// Framework-free callback: the UI registers a handler (e.g. the ToastProvider)
+// and every write op reports its progress through the pipeline from here.
+let txLifecycleHandler: TxLifecycleHandler | null = null;
+
+export function setTxLifecycleHandler(fn: TxLifecycleHandler | null) {
+  txLifecycleHandler = fn;
+}
+
+function emitTx(event: TxLifecycleEvent) {
+  txLifecycleHandler?.(event);
+}
+
 /** Build, simulate, sign (Freighter), and submit a state-changing call. */
 async function invokeWrite(
   contractId: string,
   method: string,
   args: xdr.ScVal[],
+  op: TxOp,
 ): Promise<{ hash: string; returnValue: unknown }> {
-  const publicKey = await getPublicKey();
-  if (!publicKey) throw new Error("Wallet not connected");
+  emitTx({ op, state: "submitting", message: "Preparing transaction…" });
+  try {
+    const publicKey = await getPublicKey();
+    if (!publicKey) throw new Error("Wallet not connected");
 
-  const account = await server.getAccount(publicKey);
-  const contract = new Contract(contractId);
+    const account = await server.getAccount(publicKey);
+    const contract = new Contract(contractId);
 
-  const built = new TransactionBuilder(account, {
-    fee: BASE_FEE,
-    networkPassphrase: NETWORK_PASSPHRASE,
-  })
-    .addOperation(contract.call(method, ...args))
-    .setTimeout(60)
-    .build();
+    const built = new TransactionBuilder(account, {
+      fee: BASE_FEE,
+      networkPassphrase: NETWORK_PASSPHRASE,
+    })
+      .addOperation(contract.call(method, ...args))
+      .setTimeout(60)
+      .build();
 
-  // Simulate to obtain the Soroban footprint + resource fees, then assemble.
-  const sim = await server.simulateTransaction(built);
-  if (rpc.Api.isSimulationError(sim)) {
-    throw new Error(`Simulation failed for ${method}: ${sim.error}`);
-  }
-  const prepared = rpc.assembleTransaction(built, sim).build();
-
-  // Sign via Freighter, rebuild from signed XDR, and submit.
-  const signedXdr = await signTransaction(prepared.toXDR());
-  const signedTx = TransactionBuilder.fromXDR(signedXdr, NETWORK_PASSPHRASE);
-
-  const sent = await server.sendTransaction(signedTx);
-  if (sent.status === "ERROR") {
-    throw new Error(`Submit failed: ${JSON.stringify(sent.errorResult)}`);
-  }
-
-  // Poll for confirmation.
-  const hash = sent.hash;
-  let attempts = 0;
-  while (attempts < 30) {
-    const res = await server.getTransaction(hash);
-    if (res.status === "SUCCESS") {
-      return {
-        hash,
-        returnValue: res.returnValue ? scValToNative(res.returnValue) : null,
-      };
+    // Simulate to obtain the Soroban footprint + resource fees, then assemble.
+    const sim = await server.simulateTransaction(built);
+    if (rpc.Api.isSimulationError(sim)) {
+      throw new Error(`Simulation failed for ${method}: ${sim.error}`);
     }
-    if (res.status === "FAILED") {
-      throw new Error(`Transaction ${hash} failed on-chain`);
+    const prepared = rpc.assembleTransaction(built, sim).build();
+
+    // Sign via Freighter, rebuild from signed XDR, and submit.
+    emitTx({ op, state: "signing", message: "Waiting for signature in Freighter…" });
+    const signedXdr = await signTransaction(prepared.toXDR());
+    const signedTx = TransactionBuilder.fromXDR(signedXdr, NETWORK_PASSPHRASE);
+
+    const sent = await server.sendTransaction(signedTx);
+    if (sent.status === "ERROR") {
+      throw new Error(`Submit failed: ${JSON.stringify(sent.errorResult)}`);
     }
-    await new Promise((r) => setTimeout(r, 1000));
-    attempts++;
+
+    // Poll for confirmation.
+    const hash = sent.hash;
+    emitTx({ op, state: "submitted", txHash: hash, message: "Broadcast to network…" });
+    let attempts = 0;
+    while (attempts < 30) {
+      const res = await server.getTransaction(hash);
+      if (res.status === "SUCCESS") {
+        emitTx({ op, state: "confirmed", txHash: hash, message: "Transaction confirmed" });
+        return {
+          hash,
+          returnValue: res.returnValue ? scValToNative(res.returnValue) : null,
+        };
+      }
+      if (res.status === "FAILED") {
+        throw new Error(`Transaction ${hash} failed on-chain`);
+      }
+      await new Promise((r) => setTimeout(r, 1000));
+      attempts++;
+    }
+    throw new Error(`Transaction ${hash} not confirmed in time`);
+  } catch (err: any) {
+    // Components push the `failed` toast via useToast() so the message lands
+    // next to their inline error without duplicating it here.
+    throw err;
   }
-  throw new Error(`Transaction ${hash} not confirmed in time`);
 }
 
 // ---------------------------------------------------------------------------
@@ -194,6 +240,7 @@ export async function getVaultStats(): Promise<VaultStats> {
       total_deposits: bigint;
       current_yield: bigint;
       seconds_until_next_draw: bigint;
+      annual_rate_bps: bigint;
       participants: string[];
       paused: boolean;
     }>(VAULT_ID, "get_vault_stats", []),
@@ -204,6 +251,7 @@ export async function getVaultStats(): Promise<VaultStats> {
     totalDeposits: BigInt(raw.total_deposits),
     currentYield: BigInt(raw.current_yield),
     secondsUntilNextDraw: Number(raw.seconds_until_next_draw),
+    annualRateBps: Number(raw.annual_rate_bps ?? 0),
     participants: raw.participants ?? [],
     ledgerCloseMs,
     paused: Boolean(raw.paused),
@@ -240,13 +288,13 @@ export async function getUsdcBalance(user: string): Promise<bigint> {
 // ---------------------------------------------------------------------------
 
 export async function deposit(from: string, amount: bigint) {
-  return invokeWrite(VAULT_ID, "deposit", [addr(from), i128(amount)]);
+  return invokeWrite(VAULT_ID, "deposit", [addr(from), i128(amount)], "deposit");
 }
 
 export async function withdraw(from: string, amount: bigint) {
-  return invokeWrite(VAULT_ID, "withdraw", [addr(from), i128(amount)]);
+  return invokeWrite(VAULT_ID, "withdraw", [addr(from), i128(amount)], "withdraw");
 }
 
 export async function executePrizeDraw() {
-  return invokeWrite(VAULT_ID, "execute_prize_draw", []);
+  return invokeWrite(VAULT_ID, "execute_prize_draw", [], "draw");
 }
